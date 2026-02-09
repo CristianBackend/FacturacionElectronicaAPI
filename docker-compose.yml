@@ -1,0 +1,103 @@
+# ============================================
+# ECF-API Docker Compose
+# Services: API, PostgreSQL 16, Redis 7
+# ============================================
+
+services:
+  # --- PostgreSQL ---
+  postgres:
+    image: postgres:16-alpine
+    container_name: ecf-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: ecf_api
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: ${DB_PASSWORD:-postgres}
+    ports:
+      - "${DB_PORT:-5432}:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d ecf_api"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+
+  # --- Redis ---
+  redis:
+    image: redis:7-alpine
+    container_name: ecf-redis
+    restart: unless-stopped
+    command: >
+      redis-server
+      --maxmemory 128mb
+      --maxmemory-policy noeviction
+      --appendonly yes
+    ports:
+      - "${REDIS_PORT:-6379}:6379"
+    volumes:
+      - redisdata:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # --- ECF API ---
+  api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: ecf-api
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    ports:
+      - "${PORT:-3000}:3000"
+    environment:
+      NODE_ENV: ${NODE_ENV:-production}
+      PORT: 3000
+      API_PREFIX: api/v1
+
+      # Database — uses internal Docker network hostname
+      DATABASE_URL: postgresql://postgres:${DB_PASSWORD:-postgres}@postgres:5432/ecf_api?schema=public
+
+      # Redis — uses internal Docker network hostname
+      REDIS_HOST: redis
+      REDIS_PORT: 6379
+      REDIS_PASSWORD: ""
+
+      # JWT
+      JWT_SECRET: ${JWT_SECRET:-change-this-in-production}
+      JWT_EXPIRATION: ${JWT_EXPIRATION:-24h}
+
+      # API Keys
+      API_KEY_PREFIX: ${API_KEY_PREFIX:-frd}
+
+      # Rate Limiting
+      THROTTLE_TTL: ${THROTTLE_TTL:-60000}
+      THROTTLE_LIMIT: ${THROTTLE_LIMIT:-60}
+
+      # DGII
+      DGII_ENVIRONMENT: ${DGII_ENVIRONMENT:-DEV}
+
+      # AWS (optional)
+      AWS_REGION: ${AWS_REGION:-us-east-1}
+      AWS_KMS_KEY_ID: ${AWS_KMS_KEY_ID:-}
+      AWS_S3_BUCKET: ${AWS_S3_BUCKET:-}
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost:3000/api/v1/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 30s
+
+volumes:
+  pgdata:
+    driver: local
+  redisdata:
+    driver: local

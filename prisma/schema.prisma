@@ -1,0 +1,477 @@
+// ===========================================
+// ECF-API - Prisma Schema
+// ===========================================
+// Multi-tenant schema con tenant_id en cada tabla
+// PostgreSQL RLS se configura via migraciones SQL custom
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+// ===========================================
+// ENUMS
+// ===========================================
+
+enum Plan {
+  STARTER
+  BUSINESS
+  ENTERPRISE
+  PLATFORM
+}
+
+enum DgiiEnvironment {
+  DEV
+  CERT
+  PROD
+}
+
+enum EcfType {
+  E31 // Factura Crédito Fiscal
+  E32 // Factura Consumo
+  E33 // Nota Débito
+  E34 // Nota Crédito
+  E41 // Comprobante Compras
+  E43 // Gastos Menores
+  E44 // Regímenes Especiales
+  E45 // Gubernamental
+  E46 // Exportaciones
+  E47 // Pagos al Exterior
+}
+
+// Tipo de comprador según DGII
+enum BuyerType {
+  CONTRIBUYENTE      // Persona jurídica o física con RNC activo en DGII → E31
+  CONSUMIDOR_FINAL   // Persona sin RNC o consumidor final → E32
+  GOBIERNO           // Entidad gubernamental → E45
+  REGIMEN_ESPECIAL   // Zona franca, exentos → E44
+  EXTRANJERO         // Persona o empresa extranjera → E46/E47
+  INFORMAL           // Proveedor sin RNC (compras informales) → E41
+
+  @@map("buyer_type")
+}
+
+enum InvoiceStatus {
+  DRAFT
+  PROCESSING
+  SENT
+  ACCEPTED
+  REJECTED
+  CONDITIONAL
+  VOIDED
+  CONTINGENCY
+  ERROR
+}
+
+enum WebhookEvent {
+  INVOICE_CREATED
+  INVOICE_ACCEPTED
+  INVOICE_REJECTED
+  INVOICE_CONDITIONAL
+  INVOICE_VOIDED
+  DOCUMENT_RECEIVED
+  COMMERCIAL_APPROVAL_RECEIVED
+  CERTIFICATE_EXPIRING
+  SEQUENCE_LOW
+}
+
+enum ApiKeyScope {
+  INVOICES_READ
+  INVOICES_WRITE
+  COMPANIES_READ
+  COMPANIES_WRITE
+  CERTIFICATES_WRITE
+  SEQUENCES_READ
+  WEBHOOKS_MANAGE
+  FULL_ACCESS
+}
+
+// ===========================================
+// CORE TABLES
+// ===========================================
+
+model Tenant {
+  id           String   @id @default(uuid()) @db.Uuid
+  name         String   @db.VarChar(200)
+  email        String   @unique @db.VarChar(320)
+  passwordHash String?  @map("password_hash") @db.VarChar(255)
+  plan         Plan     @default(STARTER)
+  isActive     Boolean  @default(true) @map("is_active")
+  metadata     Json?    @db.JsonB
+  createdAt    DateTime @default(now()) @map("created_at")
+  updatedAt    DateTime @updatedAt @map("updated_at")
+
+  // Relations
+  companies    Company[]
+  buyers       Buyer[]
+  apiKeys      ApiKey[]
+  webhooks     WebhookSubscription[]
+  auditLogs    AuditLog[]
+
+  @@map("tenants")
+}
+
+model Company {
+  id            String          @id @default(uuid()) @db.Uuid
+  tenantId      String          @map("tenant_id") @db.Uuid
+  rnc           String          @db.VarChar(11)
+  businessName  String          @map("business_name") @db.VarChar(250)
+  tradeName     String?         @map("trade_name") @db.VarChar(250)
+  address       String?         @db.VarChar(500)
+  phone         String?         @db.VarChar(20)
+  email         String?         @db.VarChar(320)
+  municipality  String?         @db.VarChar(100)
+  province      String?         @db.VarChar(100)
+  activityCode  String?         @map("activity_code") @db.VarChar(10)
+  dgiiEnv       DgiiEnvironment @default(DEV) @map("dgii_environment")
+  isActive      Boolean         @default(true) @map("is_active")
+  createdAt     DateTime        @default(now()) @map("created_at")
+  updatedAt     DateTime        @updatedAt @map("updated_at")
+
+  // Relations
+  tenant        Tenant          @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  certificates  Certificate[]
+  sequences     Sequence[]
+  invoices      Invoice[]
+  dgiiTokens    DgiiToken[]
+
+  @@unique([tenantId, rnc])
+  @@index([tenantId])
+  @@map("companies")
+}
+
+model Buyer {
+  id                String      @id @default(uuid()) @db.Uuid
+  tenantId          String      @map("tenant_id") @db.Uuid
+  rnc               String?     @db.VarChar(11)           // null for consumidor final sin RNC
+  name              String      @db.VarChar(250)
+  commercialName    String?     @map("commercial_name") @db.VarChar(250)
+  buyerType         BuyerType   @default(CONSUMIDOR_FINAL) @map("buyer_type")
+  email             String?     @db.VarChar(320)
+  phone             String?     @db.VarChar(20)
+  address           String?     @db.VarChar(500)
+  municipality      String?     @db.VarChar(100)
+  province          String?     @db.VarChar(100)
+  contactPerson     String?     @map("contact_person") @db.VarChar(250)
+
+  // DGII data (auto-filled)
+  dgiiStatus             String?   @map("dgii_status") @db.VarChar(50)
+  dgiiPaymentRegime      String?   @map("dgii_payment_regime") @db.VarChar(50)
+  dgiiEconomicActivity   String?   @map("dgii_economic_activity") @db.Text
+  dgiiIsElectronicInvoicer Boolean? @default(false) @map("dgii_is_electronic_invoicer")
+  dgiiLastVerified       DateTime? @map("dgii_last_verified")
+
+  // Defaults
+  defaultEcfType    EcfType?    @map("default_ecf_type")
+  defaultPaymentType Int?       @map("default_payment_type")
+  notes             String?     @db.Text
+
+  isActive          Boolean     @default(true) @map("is_active")
+  createdAt         DateTime    @default(now()) @map("created_at")
+  updatedAt         DateTime    @updatedAt @map("updated_at")
+
+  // Relations
+  tenant            Tenant      @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  invoices          Invoice[]
+
+  @@unique([tenantId, rnc])
+  @@index([tenantId])
+  @@index([name])
+  @@map("buyers")
+}
+
+model Certificate {
+  id              String   @id @default(uuid()) @db.Uuid
+  tenantId        String   @map("tenant_id") @db.Uuid
+  companyId       String   @map("company_id") @db.Uuid
+  encryptedP12    Bytes    @map("encrypted_p12")
+  encryptedPass   String   @map("encrypted_passphrase") @db.VarChar(500)
+  fingerprint     String   @db.VarChar(64)
+  issuer          String?  @db.VarChar(250)
+  subject         String?  @db.VarChar(250)
+  serialNumber    String?  @map("serial_number") @db.VarChar(100)
+  validFrom       DateTime @map("valid_from")
+  validTo         DateTime @map("valid_to")
+  isActive        Boolean  @default(true) @map("is_active")
+  kmsKeyId        String?  @map("kms_key_id") @db.VarChar(200)
+  createdAt       DateTime @default(now()) @map("created_at")
+  updatedAt       DateTime @updatedAt @map("updated_at")
+
+  // Relations
+  company Company @relation(fields: [companyId], references: [id], onDelete: Cascade)
+
+  @@index([tenantId])
+  @@index([companyId])
+  @@map("certificates")
+}
+
+model Sequence {
+  id            String   @id @default(uuid()) @db.Uuid
+  tenantId      String   @map("tenant_id") @db.Uuid
+  companyId     String   @map("company_id") @db.Uuid
+  ecfType       EcfType  @map("ecf_type")
+  prefix        String   @db.VarChar(3) // E31, E32, etc.
+  currentNumber Int      @default(0) @map("current_number")
+  startNumber   Int      @map("start_number")
+  endNumber     Int      @map("end_number")
+  expiresAt     DateTime? @map("expires_at")
+  isActive      Boolean  @default(true) @map("is_active")
+  createdAt     DateTime @default(now()) @map("created_at")
+  updatedAt     DateTime @updatedAt @map("updated_at")
+
+  // Relations
+  company Company @relation(fields: [companyId], references: [id], onDelete: Cascade)
+
+  @@unique([companyId, ecfType, isActive])
+  @@index([tenantId])
+  @@map("sequences")
+}
+
+// ===========================================
+// INVOICE TABLES
+// ===========================================
+
+model Invoice {
+  id              String        @id @default(uuid()) @db.Uuid
+  tenantId        String        @map("tenant_id") @db.Uuid
+  companyId       String        @map("company_id") @db.Uuid
+  ecfType         EcfType       @map("ecf_type")
+  encf            String?       @db.VarChar(13) // E310000000001
+  status          InvoiceStatus @default(DRAFT)
+  trackId         String?       @map("track_id") @db.VarChar(100)
+  securityCode    String?       @map("security_code") @db.VarChar(6)
+
+  // Buyer info
+  buyerId         String?       @map("buyer_id") @db.Uuid
+  buyerRnc        String?       @map("buyer_rnc") @db.VarChar(11)
+  buyerName       String?       @map("buyer_name") @db.VarChar(250)
+  buyerEmail      String?       @map("buyer_email") @db.VarChar(320)
+
+  // Amounts
+  subtotal        Decimal       @default(0) @db.Decimal(18, 2)
+  totalDiscount   Decimal       @default(0) @map("total_discount") @db.Decimal(18, 2)
+  totalItbis      Decimal       @default(0) @map("total_itbis") @db.Decimal(18, 2)
+  totalIsc        Decimal       @default(0) @map("total_isc") @db.Decimal(18, 2)
+  totalAmount     Decimal       @default(0) @map("total_amount") @db.Decimal(18, 2)
+
+  // Payment
+  paymentType     Int?          @map("payment_type") // 1=Efectivo, 2=Cheque, 3=Transferencia, 4=Tarjeta, etc.
+  paymentDate     DateTime?     @map("payment_date")
+
+  // Reference (for credit/debit notes)
+  referenceEncf   String?       @map("reference_encf") @db.VarChar(13)
+  referenceDate   DateTime?     @map("reference_date")
+
+  // XML storage
+  xmlUnsigned     String?       @map("xml_unsigned") @db.Text
+  xmlSigned       String?       @map("xml_signed") @db.Text
+  xmlS3Key        String?       @map("xml_s3_key") @db.VarChar(500)
+
+  // Signing
+  signedAt        DateTime?     @map("signed_at")
+  signatureValue  String?       @map("signature_value") @db.Text
+
+  // RFCE (Resumen Factura Consumo < 250K)
+  isRfce          Boolean       @default(false) @map("is_rfce")
+  xmlRfce         String?       @map("xml_rfce") @db.Text
+
+  // Reference extras (for NC/ND)
+  referenceModCode Int?         @map("reference_mod_code") // 1=Anula, 2=Texto, 3=Montos, 4=Contingencia
+
+  // DGII response
+  dgiiResponse    Json?         @map("dgii_response") @db.JsonB
+  dgiiMessage     String?       @map("dgii_message") @db.Text
+  dgiiTimestamp   DateTime?     @map("dgii_timestamp")
+
+  // Currency
+  currency        String        @default("DOP") @db.VarChar(3)
+  exchangeRate    Decimal?      @map("exchange_rate") @db.Decimal(12, 4)
+
+  // Idempotency
+  idempotencyKey  String?       @unique @map("idempotency_key") @db.VarChar(64)
+
+  // Metadata
+  metadata        Json?         @db.JsonB
+  createdAt       DateTime      @default(now()) @map("created_at")
+  updatedAt       DateTime      @updatedAt @map("updated_at")
+
+  // Relations
+  company    Company       @relation(fields: [companyId], references: [id])
+  buyer      Buyer?        @relation(fields: [buyerId], references: [id])
+  lines      InvoiceLine[]
+
+  @@index([tenantId])
+  @@index([companyId])
+  @@index([buyerId])
+  @@index([encf])
+  @@index([status])
+  @@index([createdAt])
+  @@map("invoices")
+}
+
+model InvoiceLine {
+  id              String  @id @default(uuid()) @db.Uuid
+  tenantId        String  @map("tenant_id") @db.Uuid
+  invoiceId       String  @map("invoice_id") @db.Uuid
+  lineNumber      Int     @map("line_number")
+  description     String  @db.VarChar(500)
+  quantity        Decimal @db.Decimal(18, 4)
+  unitPrice       Decimal @map("unit_price") @db.Decimal(18, 4)
+  discount        Decimal @default(0) @db.Decimal(18, 2)
+  itbisRate        Decimal @default(18) @map("itbis_rate") @db.Decimal(5, 2) // 18, 16, 0
+  itbisAmount     Decimal @default(0) @map("itbis_amount") @db.Decimal(18, 2)
+  iscAmount       Decimal @default(0) @map("isc_amount") @db.Decimal(18, 2)
+  subtotal        Decimal @db.Decimal(18, 2)
+
+  // ISC / Additional taxes
+  additionalTaxCode String? @map("additional_tax_code") @db.VarChar(3)
+  additionalTaxRate Decimal? @map("additional_tax_rate") @db.Decimal(10, 6)
+
+  // Goods/Service indicator
+  goodService     Int     @default(1) @map("good_service") // 1=Bien, 2=Servicio
+
+  // Relations
+  invoice Invoice @relation(fields: [invoiceId], references: [id], onDelete: Cascade)
+
+  @@index([tenantId])
+  @@index([invoiceId])
+  @@map("invoice_lines")
+}
+
+// ===========================================
+// AUTH & API KEYS
+// ===========================================
+
+model ApiKey {
+  id          String        @id @default(uuid()) @db.Uuid
+  tenantId    String        @map("tenant_id") @db.Uuid
+  name        String        @db.VarChar(100)
+  keyHash     String        @unique @map("key_hash") @db.VarChar(128)
+  keyPrefix   String        @map("key_prefix") @db.VarChar(20) // frd_live_abc... (primeros chars para identificación)
+  scopes      ApiKeyScope[]
+  isLive      Boolean       @default(false) @map("is_live") // false = test, true = production
+  lastUsedAt  DateTime?     @map("last_used_at")
+  expiresAt   DateTime?     @map("expires_at")
+  isActive    Boolean       @default(true) @map("is_active")
+  createdAt   DateTime      @default(now()) @map("created_at")
+
+  // Relations
+  tenant Tenant @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+
+  @@index([tenantId])
+  @@map("api_keys")
+}
+
+// ===========================================
+// WEBHOOKS
+// ===========================================
+
+model WebhookSubscription {
+  id          String         @id @default(uuid()) @db.Uuid
+  tenantId    String         @map("tenant_id") @db.Uuid
+  url         String         @db.VarChar(500)
+  events      WebhookEvent[]
+  secretHash  String         @map("secret_hash") @db.VarChar(128)
+  isActive    Boolean        @default(true) @map("is_active")
+  createdAt   DateTime       @default(now()) @map("created_at")
+  updatedAt   DateTime       @updatedAt @map("updated_at")
+
+  // Relations
+  tenant      Tenant               @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  deliveries  WebhookDelivery[]
+
+  @@index([tenantId])
+  @@map("webhook_subscriptions")
+}
+
+model WebhookDelivery {
+  id              String   @id @default(uuid()) @db.Uuid
+  tenantId        String   @map("tenant_id") @db.Uuid
+  subscriptionId  String   @map("subscription_id") @db.Uuid
+  event           WebhookEvent
+  payload         Json     @db.JsonB
+  statusCode      Int?     @map("status_code")
+  responseBody    String?  @map("response_body") @db.Text
+  attempts        Int      @default(0)
+  maxAttempts     Int      @default(5) @map("max_attempts")
+  nextRetryAt     DateTime? @map("next_retry_at")
+  deliveredAt     DateTime? @map("delivered_at")
+  createdAt       DateTime @default(now()) @map("created_at")
+
+  // Relations
+  subscription WebhookSubscription @relation(fields: [subscriptionId], references: [id], onDelete: Cascade)
+
+  @@index([tenantId])
+  @@index([nextRetryAt])
+  @@map("webhook_deliveries")
+}
+
+// ===========================================
+// SEQUENCE ANNULMENTS (ANECF)
+// ===========================================
+
+model SequenceAnnulment {
+  id            String   @id @default(uuid()) @db.Uuid
+  tenantId      String   @map("tenant_id") @db.Uuid
+  companyId     String   @map("company_id") @db.Uuid
+  encfFrom      String   @map("encf_from") @db.VarChar(13)
+  encfTo        String   @map("encf_to") @db.VarChar(13)
+  xmlAnecf      String?  @map("xml_anecf") @db.Text
+  xmlSigned     String?  @map("xml_signed") @db.Text
+  status        String   @default("PENDING") @db.VarChar(20) // PENDING, SENT, ACCEPTED, REJECTED
+  dgiiResponse  String?  @map("dgii_response") @db.Text
+  createdAt     DateTime @default(now()) @map("created_at")
+
+  @@index([tenantId])
+  @@index([companyId])
+  @@map("sequence_annulments")
+}
+
+// ===========================================
+// DGII TOKEN CACHE
+// ===========================================
+
+model DgiiToken {
+  id          String          @id @default(uuid()) @db.Uuid
+  tenantId    String          @map("tenant_id") @db.Uuid
+  companyId   String          @map("company_id") @db.Uuid
+  token       String          @db.Text
+  environment DgiiEnvironment
+  expiresAt   DateTime        @map("expires_at")
+  createdAt   DateTime        @default(now()) @map("created_at")
+
+  // Relations
+  company Company @relation(fields: [companyId], references: [id], onDelete: Cascade)
+
+  @@index([tenantId])
+  @@index([companyId, environment])
+  @@map("dgii_tokens")
+}
+
+// ===========================================
+// AUDIT LOG
+// ===========================================
+
+model AuditLog {
+  id          String   @id @default(uuid()) @db.Uuid
+  tenantId    String   @map("tenant_id") @db.Uuid
+  entityType  String   @map("entity_type") @db.VarChar(50) // invoice, company, certificate
+  entityId    String   @map("entity_id") @db.VarChar(50)
+  action      String   @db.VarChar(50) // created, updated, signed, sent, accepted
+  actor       String?  @db.VarChar(100) // api_key name or system
+  metadata    Json?    @db.JsonB
+  ipAddress   String?  @map("ip_address") @db.VarChar(45)
+  createdAt   DateTime @default(now()) @map("created_at")
+
+  // Relations
+  tenant Tenant @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+
+  @@index([tenantId])
+  @@index([entityType, entityId])
+  @@index([createdAt])
+  @@map("audit_logs")
+}

@@ -1,0 +1,157 @@
+import { Processor, WorkerHost } from '@nestjs/bullmq';
+import { Logger } from '@nestjs/common';
+import { Job } from 'bullmq';
+import { PrismaService } from '../prisma/prisma.service';
+import { DgiiService } from '../dgii/dgii.service';
+import { SigningService } from '../signing/signing.service';
+import { CertificatesService } from '../certificates/certificates.service';
+import { InvoiceStatus } from '@prisma/client';
+import { QUEUES } from './queue.constants';
+
+export interface StatusPollJobData {
+  invoiceId: string;
+  tenantId: string;
+  companyId: string;
+  /** How many times we've polled this invoice */
+  attempt?: number;
+}
+
+/**
+ * ECF Status Poll Worker
+ *
+ * Polls DGII's QueryStatus endpoint to check if an invoice
+ * has been ACCEPTED or REJECTED after submission.
+ *
+ * Strategy:
+ * - Poll with exponential backoff: 30s, 1m, 2m, 5m, 10m, 30m, 1h
+ * - Max 20 attempts (~24 hours of polling)
+ * - On final status (ACCEPTED/REJECTED), fire webhook
+ * - On CONDITIONAL, log and stop (requires manual action)
+ */
+@Processor(QUEUES.ECF_STATUS_POLL)
+export class StatusPollProcessor extends WorkerHost {
+  private readonly logger = new Logger(StatusPollProcessor.name);
+
+  /** Max polling attempts before giving up */
+  private static readonly MAX_ATTEMPTS = 20;
+
+  constructor(
+    private readonly prisma: PrismaService,
+    private readonly dgiiService: DgiiService,
+    private readonly signingService: SigningService,
+    private readonly certificatesService: CertificatesService,
+  ) {
+    super();
+  }
+
+  async process(job: Job<StatusPollJobData>): Promise<any> {
+    const { invoiceId, tenantId, companyId, attempt = 1 } = job.data;
+    this.logger.log(`Status poll #${attempt} for invoice ${invoiceId}`);
+
+    // Load invoice
+    const invoice = await this.prisma.invoice.findFirst({
+      where: { id: invoiceId, tenantId },
+      include: { company: true },
+    });
+
+    if (!invoice) {
+      this.logger.error(`Invoice ${invoiceId} not found`);
+      return { status: 'NOT_FOUND' };
+    }
+
+    // Already in final state
+    if (invoice.status === InvoiceStatus.ACCEPTED ||
+        invoice.status === InvoiceStatus.REJECTED ||
+        invoice.status === InvoiceStatus.VOIDED) {
+      this.logger.log(`Invoice ${invoiceId} already final: ${invoice.status}`);
+      return { status: invoice.status, final: true };
+    }
+
+    if (!invoice.trackId) {
+      this.logger.warn(`Invoice ${invoiceId} has no trackId`);
+      return { status: 'NO_TRACK_ID' };
+    }
+
+    // Max attempts reached
+    if (attempt > StatusPollProcessor.MAX_ATTEMPTS) {
+      this.logger.warn(`Max polling attempts reached for ${invoice.encf}`);
+      await this.prisma.invoice.update({
+        where: { id: invoiceId },
+        data: {
+          dgiiMessage: `Status polling timed out after ${attempt - 1} attempts. Last status: ${invoice.status}`,
+        },
+      });
+      return { status: 'TIMEOUT', attempts: attempt - 1 };
+    }
+
+    try {
+      // Authenticate
+      const { p12Buffer, passphrase } = await this.certificatesService.getDecryptedCertificate(
+        tenantId, companyId,
+      );
+      const { privateKey, certificate } = this.signingService.extractFromP12(p12Buffer, passphrase);
+      const token = await this.dgiiService.getToken(
+        tenantId, companyId, privateKey, certificate, invoice.company.dgiiEnv,
+      );
+
+      // Query DGII
+      const result = await this.dgiiService.queryStatus(
+        invoice.trackId, token, invoice.company.dgiiEnv,
+      );
+
+      const newStatus = this.mapDgiiStatus(result.status);
+      const isFinal = newStatus === InvoiceStatus.ACCEPTED ||
+        newStatus === InvoiceStatus.REJECTED ||
+        newStatus === InvoiceStatus.CONDITIONAL;
+
+      // Update if status changed
+      if (newStatus !== invoice.status) {
+        await this.prisma.invoice.update({
+          where: { id: invoiceId },
+          data: {
+            status: newStatus,
+            dgiiResponse: result as any,
+            dgiiMessage: result.message,
+            dgiiTimestamp: new Date(),
+          },
+        });
+
+        this.logger.log(`${invoice.encf}: ${invoice.status} → ${newStatus}`);
+      }
+
+      // If still processing, throw to trigger BullMQ retry with backoff
+      if (!isFinal) {
+        throw new Error(`POLL_CONTINUE: ${invoice.encf} still ${newStatus} (attempt ${attempt})`);
+      }
+
+      return {
+        status: newStatus,
+        final: true,
+        encf: invoice.encf,
+        attempts: attempt,
+        dgiiMessage: result.message,
+      };
+
+    } catch (error: any) {
+      // Re-throw for BullMQ retry if it's a POLL_CONTINUE or network error
+      if (error.message?.startsWith('POLL_CONTINUE') ||
+          error.message?.includes('ECONNREFUSED') ||
+          error.message?.includes('ETIMEDOUT')) {
+        throw error;
+      }
+
+      this.logger.error(`Poll error for ${invoice.encf}: ${error.message}`);
+      return { status: 'ERROR', error: error.message };
+    }
+  }
+
+  private mapDgiiStatus(dgiiStatus: number): InvoiceStatus {
+    switch (dgiiStatus) {
+      case 1: return InvoiceStatus.ACCEPTED;
+      case 2: return InvoiceStatus.REJECTED;
+      case 3: return InvoiceStatus.PROCESSING;
+      case 4: return InvoiceStatus.CONDITIONAL;
+      default: return InvoiceStatus.SENT;
+    }
+  }
+}

@@ -1,0 +1,8 @@
+{
+  "compilerOptions": {
+    "tsConfigPath": "tsconfig.json",
+    "assets": [],
+    "watchAssets": false,
+    "deleteOutDir": true
+  }
+}

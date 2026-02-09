@@ -1,0 +1,47 @@
+import { Module } from '@nestjs/common';
+import { BullModule } from '@nestjs/bullmq';
+import { PrismaModule } from '../prisma/prisma.module';
+import { XmlBuilderModule } from '../xml-builder/xml-builder.module';
+import { SigningModule } from '../signing/signing.module';
+import { DgiiModule } from '../dgii/dgii.module';
+import { CertificatesModule } from '../certificates/certificates.module';
+
+import { EcfProcessingProcessor } from './ecf-processing.processor';
+import { StatusPollProcessor } from './status-poll.processor';
+import { WebhookDeliveryProcessor } from './webhook-delivery.processor';
+import { CertificateCheckProcessor } from './certificate-check.processor';
+import { QueueService } from './queue.service';
+import { QUEUES } from './queue.constants';
+
+// Re-export for convenience
+export { QUEUES } from './queue.constants';
+
+@Module({
+  imports: [
+    BullModule.registerQueue(
+      { name: QUEUES.ECF_PROCESSING },
+      { name: QUEUES.ECF_STATUS_POLL },
+      { name: QUEUES.WEBHOOK_DELIVERY },
+      { name: QUEUES.CERTIFICATE_CHECK },
+    ),
+
+    // Dependencies needed by processors
+    PrismaModule,
+    XmlBuilderModule,
+    SigningModule,
+    DgiiModule,
+    CertificatesModule,
+  ],
+  providers: [
+    // Processors (auto-registered as BullMQ workers)
+    EcfProcessingProcessor,
+    StatusPollProcessor,
+    WebhookDeliveryProcessor,
+    CertificateCheckProcessor,
+
+    // Service for enqueuing jobs
+    QueueService,
+  ],
+  exports: [BullModule, QueueService],
+})
+export class QueueModule {}

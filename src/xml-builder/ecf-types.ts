@@ -1,0 +1,316 @@
+/**
+ * ECF Types and Constants for Dominican Republic e-CF
+ * Based on DGII Technical Documentation v1.0 + Informe Técnico
+ * Updated: Full compliance audit
+ */
+
+/** e-CF Type codes as used in the eNCF format */
+export const ECF_TYPE_CODES = {
+  E31: 31, // Factura de Crédito Fiscal Electrónica
+  E32: 32, // Factura de Consumo Electrónica
+  E33: 33, // Nota de Débito Electrónica
+  E34: 34, // Nota de Crédito Electrónica
+  E41: 41, // Compras Electrónico
+  E43: 43, // Gastos Menores Electrónico
+  E44: 44, // Regímenes Especiales Electrónico
+  E45: 45, // Gubernamental Electrónico
+  E46: 46, // Exportaciones Electrónico
+  E47: 47, // Pagos al Exterior Electrónico
+} as const;
+
+/** Human-readable names for each e-CF type */
+export const ECF_TYPE_NAMES: Record<number, string> = {
+  31: 'Factura de Crédito Fiscal Electrónica',
+  32: 'Factura de Consumo Electrónica',
+  33: 'Nota de Débito Electrónica',
+  34: 'Nota de Crédito Electrónica',
+  41: 'Comprobante de Compras Electrónico',
+  43: 'Comprobante de Gastos Menores Electrónico',
+  44: 'Comprobante de Regímenes Especiales Electrónico',
+  45: 'Comprobante Gubernamental Electrónico',
+  46: 'Comprobante de Exportaciones Electrónico',
+  47: 'Comprobante de Pagos al Exterior Electrónico',
+};
+
+/** Which e-CF types ALWAYS require buyer RNC (código obligatoriedad = 1)
+ * E46: código 2 (condicional - Zonas Francas a Residentes)
+ * E47: código 0 (RNC NO corresponde)
+ */
+export const REQUIRES_BUYER_RNC = [31, 41, 45];
+
+/** E-CF types where Comprador section itself is condicional (código 2) or optional (código 3)
+ * E33, E34: Comprador código 2
+ * E44: Comprador código 1 but RNC código 2
+ * E46: Comprador código 1 but RNC código 2
+ * E47: Comprador código 3
+ */
+
+/** Which e-CF types require InformacionReferencia */
+export const REQUIRES_REFERENCE = [33, 34]; // Notas débito y crédito
+
+/** ITBIS rates allowed in Dominican Republic */
+export const ITBIS_RATES = {
+  STANDARD: 18,  // Tasa estándar
+  REDUCED: 16,   // Tasa reducida
+  EXEMPT: 0,     // Exento
+} as const;
+
+/** Payment types per DGII specification */
+export const PAYMENT_TYPES = {
+  CASH: 1,
+  CHECK: 2,
+  CREDIT_CARD: 3,
+  CREDIT: 4,
+  BONDS: 5,
+  SWAP: 6,
+  NOTE: 7,
+  MIXED: 8,
+  OTHER: 9,
+} as const;
+
+/** Income type indicator (Tipo de Ingreso) */
+export const INCOME_TYPES = {
+  OPERATIONAL: 1,
+  FINANCIAL: 2,
+  EXTRAORDINARY: 3,
+  LEASING: 4,
+  ASSET_SALE: 5,
+  OTHER: 6,
+} as const;
+
+// ============================================================
+// MODIFICATION CODES (for Notas de Crédito/Débito)
+// ============================================================
+
+/** Modification codes per DGII Informe Técnico */
+export const MODIFICATION_CODES = {
+  VOID: 1,           // Anula el NCF modificado
+  CORRECT_TEXT: 2,   // Corrige texto del comprobante fiscal modificado
+  CORRECT_AMOUNT: 3, // Corrige montos del NCF modificado
+  REPLACE_CONTINGENCY: 4, // Reemplazo NCF emitido en contingencia
+} as const;
+
+export const MODIFICATION_CODE_NAMES: Record<number, string> = {
+  1: 'Anula el NCF modificado',
+  2: 'Corrige texto del comprobante fiscal modificado',
+  3: 'Corrige montos del NCF modificado',
+  4: 'Reemplazo NCF emitido en contingencia',
+};
+
+// ============================================================
+// ADDITIONAL TAX CODES (Impuestos Adicionales)
+// ============================================================
+
+/**
+ * Codificación Tipos de Impuestos Adicionales
+ * Codes 001-005: Otros Impuestos Adicionales
+ * Codes 006-018: ISC Específico Alcoholes
+ * Codes 019-022: ISC Específico Cigarrillos
+ * Codes 023-035: ISC Ad-Valorem Alcoholes
+ * Codes 036-039: ISC Ad-Valorem Cigarrillos
+ */
+export const ADDITIONAL_TAX_TYPES = {
+  // Otros impuestos (001-005)
+  PROPINA_LEGAL: '001',
+  CDT: '002',                     // Contribución Desarrollo Telecomunicaciones
+  SERVICIOS_SEGUROS: '003',
+  SERVICIOS_TELECOM: '004',
+  EXPEDICION_PRIMERA_PLACA: '005',
+  // ISC ranges
+  ISC_ESPECIFICO_ALCOHOL_START: '006',
+  ISC_ESPECIFICO_ALCOHOL_END: '018',
+  ISC_ESPECIFICO_CIGARRILLO_START: '019',
+  ISC_ESPECIFICO_CIGARRILLO_END: '022',
+  ISC_ADVALOREM_ALCOHOL_START: '023',
+  ISC_ADVALOREM_ALCOHOL_END: '035',
+  ISC_ADVALOREM_CIGARRILLO_START: '036',
+  ISC_ADVALOREM_CIGARRILLO_END: '039',
+} as const;
+
+/** Check if tax code is ISC Específico (alcohol) */
+export function isIscEspecificoAlcohol(code: string): boolean {
+  const num = parseInt(code, 10);
+  return num >= 6 && num <= 18;
+}
+
+/** Check if tax code is ISC Ad-Valorem (alcohol) */
+export function isIscAdvaloremAlcohol(code: string): boolean {
+  const num = parseInt(code, 10);
+  return num >= 23 && num <= 35;
+}
+
+/** Check if tax code is ISC Específico (cigarrillo) */
+export function isIscEspecificoCigarrillo(code: string): boolean {
+  const num = parseInt(code, 10);
+  return num >= 19 && num <= 22;
+}
+
+/** Check if tax code is ISC Ad-Valorem (cigarrillo) */
+export function isIscAdvaloremCigarrillo(code: string): boolean {
+  const num = parseInt(code, 10);
+  return num >= 36 && num <= 39;
+}
+
+/** Check if tax code is "Otros Impuestos" (not ISC) */
+export function isOtrosImpuestos(code: string): boolean {
+  const num = parseInt(code, 10);
+  return num >= 1 && num <= 5;
+}
+
+// ============================================================
+// DGII ENDPOINTS
+// ============================================================
+
+export const DGII_ENDPOINTS = {
+  DEV: {
+    base: 'https://ecf.dgii.gov.do/testecf',
+    fc: 'https://fc.dgii.gov.do/testecf',
+  },
+  CERT: {
+    base: 'https://ecf.dgii.gov.do/certecf',
+    fc: 'https://fc.dgii.gov.do/certecf',
+  },
+  PROD: {
+    base: 'https://ecf.dgii.gov.do/ecf',
+    fc: 'https://fc.dgii.gov.do',
+  },
+} as const;
+
+/** DGII service paths */
+export const DGII_SERVICES = {
+  SEED: '/api/autenticacion/semilla',
+  VALIDATE_SEED: '/api/autenticacion/validarsemilla',
+  SEND_ECF: '/api/facturaselectronicas',
+  QUERY_STATUS: '/api/consultaresultado',
+  QUERY_TRACK: '/api/consultaestado',
+  VOID: '/api/anulacion',
+  DIRECTORY: '/api/directorio',
+  STATUS_CHECK: '/api/estatusservicio',
+  // FC-specific (facturas consumo < 250K)
+  FC_RECEIVE: '/api/recepcionfc',
+  FC_QUERY: '/api/consultarfce',
+  // Aprobación Comercial
+  COMMERCIAL_APPROVAL: '/api/aprobacioncomercial',
+  // Comunicación Emisor-Receptor (solo precertificación)
+  COMM_EMISOR_RECEPTOR: '/api/comunicacion',
+} as const;
+
+/** DGII response status codes */
+export const DGII_STATUS = {
+  NOT_FOUND: 0,
+  ACCEPTED: 1,
+  REJECTED: 2,
+  IN_PROCESS: 3,
+  CONDITIONAL: 4, // Aceptado Condicional
+} as const;
+
+// ============================================================
+// THRESHOLDS AND LIMITS
+// ============================================================
+
+/** Factura Consumo < 250K sends only RFCE (resumen) */
+export const FC_FULL_SUBMISSION_THRESHOLD = 250000;
+
+/** Maximum items per e-CF (1000 normal, 10000 for FC < 250K) */
+export const MAX_ITEMS_PER_ECF = 1000;
+export const MAX_ITEMS_FC_UNDER_250K = 10000;
+
+/** NC/ND: days after which ITBIS cannot be returned */
+export const NC_ITBIS_RETURN_LIMIT_DAYS = 30;
+
+/** e-CF storage requirement: 10 years */
+export const STORAGE_RETENTION_YEARS = 10;
+
+// ============================================================
+// QR CODE URL TEMPLATES (per DGII Informe Técnico)
+// ============================================================
+
+/**
+ * QR URL for standard e-CF (all types except FC < 250K)
+ * Parameters: RncEmisor, RncComprador, ENCF, FechaEmision(dd-MM-aaaa),
+ *             MontoTotal, FechaFirma(dd-MM-aaaa HH:mm:ss), CodigoSeguridad
+ */
+export const QR_URL_STANDARD = 'https://ecf.dgii.gov.do/ecf/ConsultaTimbre';
+
+/**
+ * QR URL for Factura Consumo < 250K
+ * Parameters: RncEmisor, ENCF, MontoTotal, CodigoSeguridad
+ */
+export const QR_URL_FC_UNDER_250K = 'https://fc.dgii.gov.do/eCF/ConsultaTimbreFC';
+
+/**
+ * Build QR URL for standard e-CF per DGII spec
+ */
+export function buildStandardQrUrl(params: {
+  rncEmisor: string;
+  rncComprador: string;
+  encf: string;
+  fechaEmision: string;     // dd-MM-aaaa
+  montoTotal: string;       // X.XX
+  fechaFirma: string;       // dd-MM-aaaa HH:mm:ss
+  codigoSeguridad: string;  // first 6 hex of SignatureValue hash
+}): string {
+  const p = params;
+  return `${QR_URL_STANDARD}?RncEmisor=${p.rncEmisor}&RncComprador=${p.rncComprador}&ENCF=${p.encf}&FechaEmision=${p.fechaEmision}&MontoTotal=${p.montoTotal}&FechaFirma=${encodeURIComponent(p.fechaFirma)}&CodigoSeguridad=${p.codigoSeguridad}`;
+}
+
+/**
+ * Build QR URL for FC < 250K per DGII spec
+ */
+export function buildFcUnder250kQrUrl(params: {
+  rncEmisor: string;
+  encf: string;
+  montoTotal: string;
+  codigoSeguridad: string;
+}): string {
+  const p = params;
+  return `${QR_URL_FC_UNDER_250K}?RncEmisor=${p.rncEmisor}&ENCF=${p.encf}&MontoTotal=${p.montoTotal}&CodigoSeguridad=${p.codigoSeguridad}`;
+}
+
+// ============================================================
+// eNCF FORMAT UTILITIES
+// ============================================================
+
+/** eNCF format: E + 2 digit type + 10 digit padded sequence */
+export function formatEncf(typeCode: number, sequenceNumber: number): string {
+  return `E${typeCode}${String(sequenceNumber).padStart(10, '0')}`;
+}
+
+/** Extract type code from eNCF string */
+export function getTypeFromEncf(encf: string): number {
+  return parseInt(encf.substring(1, 3), 10);
+}
+
+/** Validate eNCF format */
+export function isValidEncf(encf: string): boolean {
+  if (!encf || encf.length !== 13) return false;
+  if (encf[0] !== 'E') return false;
+  const typeCode = parseInt(encf.substring(1, 3), 10);
+  const validTypes = [31, 32, 33, 34, 41, 43, 44, 45, 46, 47];
+  if (!validTypes.includes(typeCode)) return false;
+  const seq = encf.substring(3);
+  return /^\d{10}$/.test(seq) && parseInt(seq, 10) > 0;
+}
+
+/**
+ * Check if a sequence has expired.
+ * Sequences are valid until December 31 of the year following authorization.
+ */
+export function isSequenceExpired(expirationDate: Date): boolean {
+  return new Date() > expirationDate;
+}
+
+/**
+ * Validate that an NCFModificado can be a valid reference.
+ * Can be serie E (13 chars), serie B (11 chars), or serie A/P (19 chars).
+ */
+export function isValidNcfModificado(ncf: string): boolean {
+  if (!ncf) return false;
+  // Serie E: E + 2 type + 10 seq = 13
+  if (ncf.startsWith('E') && ncf.length === 13) return true;
+  // Serie B: B + 2 type + 8 seq = 11
+  if (ncf.startsWith('B') && ncf.length === 11) return true;
+  // Serie A or P: 19 chars
+  if ((ncf.startsWith('A') || ncf.startsWith('P')) && ncf.length === 19) return true;
+  return false;
+}

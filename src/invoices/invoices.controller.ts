@@ -1,0 +1,128 @@
+import {
+  Controller,
+  Post,
+  Get,
+  Body,
+  Param,
+  Query,
+  Res,
+  UseGuards,
+  HttpCode,
+  HttpStatus,
+} from '@nestjs/common';
+import { ApiTags, ApiBearerAuth, ApiOperation, ApiQuery } from '@nestjs/swagger';
+import { Response } from 'express';
+import { InvoicesService } from './invoices.service';
+import { CreateInvoiceDto } from './dto/invoice.dto';
+import { ApiKeyGuard } from '../common/guards/api-key.guard';
+import { RequireScopes } from '../common/decorators/scopes.decorator';
+import { CurrentTenant, RequestTenant } from '../common/decorators/tenant.decorator';
+import { ApiKeyScope } from '@prisma/client';
+
+@ApiTags('invoices')
+@Controller('invoices')
+@UseGuards(ApiKeyGuard)
+@ApiBearerAuth('api-key')
+export class InvoicesController {
+  constructor(private readonly invoicesService: InvoicesService) {}
+
+  @Post()
+  @RequireScopes(ApiKeyScope.INVOICES_WRITE)
+  @HttpCode(HttpStatus.CREATED)
+  @ApiOperation({
+    summary: 'Crear factura electrónica (e-CF)',
+    description:
+      'Crea una factura, construye XML según XSD de DGII, firma digitalmente, ' +
+      'y envía a la DGII. Soporta los 10 tipos de e-CF (31-47).',
+  })
+  async create(
+    @CurrentTenant() tenant: RequestTenant,
+    @Body() dto: CreateInvoiceDto,
+  ) {
+    return this.invoicesService.create(tenant.id, dto);
+  }
+
+  @Get()
+  @RequireScopes(ApiKeyScope.INVOICES_READ)
+  @ApiOperation({ summary: 'Listar facturas con filtros' })
+  @ApiQuery({ name: 'companyId', required: false })
+  @ApiQuery({ name: 'ecfType', required: false, enum: ['E31', 'E32', 'E33', 'E34', 'E41', 'E43', 'E44', 'E45', 'E46', 'E47'] })
+  @ApiQuery({ name: 'status', required: false, enum: ['DRAFT', 'PROCESSING', 'ACCEPTED', 'REJECTED', 'CONDITIONAL', 'VOIDED', 'CONTINGENCY'] })
+  @ApiQuery({ name: 'dateFrom', required: false, description: 'YYYY-MM-DD' })
+  @ApiQuery({ name: 'dateTo', required: false, description: 'YYYY-MM-DD' })
+  @ApiQuery({ name: 'page', required: false, type: Number })
+  @ApiQuery({ name: 'limit', required: false, type: Number })
+  async findAll(
+    @CurrentTenant() tenant: RequestTenant,
+    @Query('companyId') companyId?: string,
+    @Query('ecfType') ecfType?: string,
+    @Query('status') status?: string,
+    @Query('dateFrom') dateFrom?: string,
+    @Query('dateTo') dateTo?: string,
+    @Query('page') page?: number,
+    @Query('limit') limit?: number,
+  ) {
+    return this.invoicesService.findAll(tenant.id, {
+      companyId,
+      ecfType,
+      status,
+      dateFrom,
+      dateTo,
+      page,
+      limit,
+    });
+  }
+
+  @Get(':id')
+  @RequireScopes(ApiKeyScope.INVOICES_READ)
+  @ApiOperation({ summary: 'Ver detalle de factura' })
+  async findOne(
+    @CurrentTenant() tenant: RequestTenant,
+    @Param('id') id: string,
+  ) {
+    return this.invoicesService.findOne(tenant.id, id);
+  }
+
+  @Get(':id/xml')
+  @RequireScopes(ApiKeyScope.INVOICES_READ)
+  @ApiOperation({ summary: 'Descargar XML de la factura' })
+  async getXml(
+    @CurrentTenant() tenant: RequestTenant,
+    @Param('id') id: string,
+    @Res() res: Response,
+  ) {
+    const xml = await this.invoicesService.getXml(tenant.id, id);
+    res.set({
+      'Content-Type': 'application/xml',
+      'Content-Disposition': `attachment; filename="${id}.xml"`,
+    });
+    res.send(xml);
+  }
+
+  @Post(':id/poll')
+  @RequireScopes(ApiKeyScope.INVOICES_WRITE)
+  @ApiOperation({
+    summary: 'Consultar estado DGII de una factura',
+    description: 'Consulta el TrackId en DGII y actualiza el estado de la factura.',
+  })
+  async pollStatus(
+    @CurrentTenant() tenant: RequestTenant,
+    @Param('id') id: string,
+  ) {
+    return this.invoicesService.pollStatus(tenant.id, id);
+  }
+
+  @Post(':id/void')
+  @RequireScopes(ApiKeyScope.INVOICES_WRITE)
+  @ApiOperation({
+    summary: 'Anular una factura',
+    description: 'Anula una factura cambiando su estado a VOIDED. Solo facturas en estado DRAFT, ERROR o CONTINGENCY pueden ser anuladas directamente. Facturas ACCEPTED requieren emitir una Nota de Crédito (E34).',
+  })
+  async voidInvoice(
+    @CurrentTenant() tenant: RequestTenant,
+    @Param('id') id: string,
+    @Body() body: { reason?: string },
+  ) {
+    return this.invoicesService.voidInvoice(tenant.id, id, body.reason);
+  }
+}
