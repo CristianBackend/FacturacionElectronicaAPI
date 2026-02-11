@@ -6,6 +6,10 @@ import {
   Logger,
 } from '@nestjs/common';
 import { PrismaService } from '../prisma/prisma.service';
+import { SigningService } from '../signing/signing.service';
+import { DgiiService } from '../dgii/dgii.service';
+import { CertificatesService } from '../certificates/certificates.service';
+import { XmlBuilderService, EmitterData } from '../xml-builder/xml-builder.service';
 import { CreateSequenceDto } from './dto/sequence.dto';
 import { EcfType } from '@prisma/client';
 
@@ -31,7 +35,13 @@ const ECF_TYPE_PREFIX: Record<EcfType, string> = {
 export class SequencesService {
   private readonly logger = new Logger(SequencesService.name);
 
-  constructor(private readonly prisma: PrismaService) {}
+  constructor(
+    private readonly prisma: PrismaService,
+    private readonly signingService: SigningService,
+    private readonly dgiiService: DgiiService,
+    private readonly certificatesService: CertificatesService,
+    private readonly xmlBuilder: XmlBuilderService,
+  ) {}
 
   /**
    * Register a new sequence range authorized by the DGII.
@@ -268,6 +278,35 @@ export class SequencesService {
       }
     }
 
+    // Build ANECF XML
+    const emitterData: EmitterData = {
+      rnc: company.rnc,
+      businessName: company.businessName,
+      tradeName: company.tradeName || undefined,
+      address: company.address || undefined,
+    };
+
+    const anecfXml = this.xmlBuilder.buildAnecfXml(
+      emitterData,
+      ranges.map(r => ({ encfDesde: r.encfFrom, encfHasta: r.encfTo })),
+    );
+
+    // Sign the ANECF XML
+    const { p12Buffer, passphrase } = await this.certificatesService.getDecryptedCertificate(
+      tenantId, companyId,
+    );
+    const { privateKey, certificate } = this.signingService.extractFromP12(p12Buffer, passphrase);
+    const { signedXml } = this.signingService.signXml(anecfXml, privateKey, certificate);
+
+    // Authenticate with DGII
+    const token = await this.dgiiService.getToken(
+      tenantId, companyId, privateKey, certificate, company.dgiiEnv,
+    );
+
+    // Submit ANECF to DGII
+    const result = await this.dgiiService.submitAnecf(signedXml, token, company.dgiiEnv);
+
+    // Store annulment records
     const annulments = [];
     for (const range of ranges) {
       const annulment = await this.prisma.sequenceAnnulment.create({
@@ -276,18 +315,20 @@ export class SequencesService {
           companyId,
           encfFrom: range.encfFrom,
           encfTo: range.encfTo,
-          status: 'PENDING',
+          status: result.success ? 'SENT' : 'ERROR',
         },
       });
       annulments.push(annulment);
     }
 
     this.logger.log(
-      `${ranges.length} annulment(s) created for company ${companyId}`,
+      `ANECF submitted for company ${companyId}: ${ranges.length} range(s), result: ${result.success ? 'OK' : 'FAILED'}`,
     );
 
     return {
-      message: `${ranges.length} rango(s) de secuencias registrados para anulación`,
+      message: `${ranges.length} rango(s) de secuencias anulados y enviados a DGII`,
+      trackId: result.trackId,
+      dgiiStatus: result.status,
       annulments,
     };
   }

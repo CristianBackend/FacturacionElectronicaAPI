@@ -32,11 +32,16 @@ export class CertificatesService {
 
   constructor(private readonly prisma: PrismaService) {
     // Derive a 256-bit key from environment secret
-    const secret = process.env.JWT_SECRET || 'dev-secret';
-    this.encryptionKey = crypto
-      .createHash('sha256')
-      .update(secret)
-      .digest();
+    const secret = process.env.JWT_SECRET;
+    if (!secret) {
+      const fallback = process.env.NODE_ENV === 'production' ? null : 'dev-secret-do-not-use-in-prod';
+      if (!fallback) {
+        throw new Error('JWT_SECRET environment variable is required in production for certificate encryption');
+      }
+      this.encryptionKey = crypto.createHash('sha256').update(fallback).digest();
+    } else {
+      this.encryptionKey = crypto.createHash('sha256').update(secret).digest();
+    }
   }
 
   /**
@@ -207,26 +212,81 @@ export class CertificatesService {
   // ========================
 
   /**
-   * Extract certificate metadata from .p12 file.
-   * TODO: Replace with node-forge for proper PKCS#12 parsing.
+   * Extract certificate metadata from .p12 file using node-forge.
+   * Parses the PKCS#12 to get real issuer, subject, serial, and validity dates.
    */
-  private extractCertInfo(p12Buffer: Buffer, _passphrase: string): CertificateInfo {
-    // Generate fingerprint from file content
-    const fingerprint = crypto
-      .createHash('sha256')
-      .update(p12Buffer)
-      .digest('hex')
+  private extractCertInfo(p12Buffer: Buffer, passphrase: string): CertificateInfo {
+    // eslint-disable-next-line @typescript-eslint/no-var-requires
+    const forge = require('node-forge');
+
+    let p12: any;
+    try {
+      const p12Asn1 = forge.asn1.fromDer(p12Buffer.toString('binary'));
+      p12 = forge.pkcs12.pkcs12FromAsn1(p12Asn1, passphrase);
+    } catch (error: any) {
+      throw new BadRequestException(
+        `No se pudo abrir el certificado .p12. Verifique la contraseña. Error: ${error.message}`,
+      );
+    }
+
+    // Extract certificate
+    const certBags = p12.getBags({ bagType: forge.pki.oids.certBag });
+    const certBag = certBags[forge.pki.oids.certBag];
+
+    if (!certBag || certBag.length === 0) {
+      throw new BadRequestException('El archivo .p12 no contiene un certificado válido');
+    }
+
+    const cert = certBag[0].cert;
+
+    // Verify private key exists
+    const keyBags = p12.getBags({ bagType: forge.pki.oids.pkcs8ShroudedKeyBag });
+    const keyBag = keyBags[forge.pki.oids.pkcs8ShroudedKeyBag];
+
+    if (!keyBag || keyBag.length === 0) {
+      throw new BadRequestException('El archivo .p12 no contiene una llave privada');
+    }
+
+    // Extract real metadata
+    const fingerprint = forge.md.sha256
+      .create()
+      .update(forge.asn1.toDer(forge.pki.certificateToAsn1(cert)).getBytes())
+      .digest()
+      .toHex()
       .substring(0, 40);
 
-    // Placeholder metadata - in production, parse .p12 with node-forge
-    // to extract real issuer, subject, validity dates
+    const getAttr = (attrs: any[], shortName: string): string => {
+      const attr = attrs.find((a: any) => a.shortName === shortName);
+      return attr ? attr.value : '';
+    };
+
+    const issuerAttrs = cert.issuer.attributes;
+    const subjectAttrs = cert.subject.attributes;
+
+    const issuer = [
+      getAttr(issuerAttrs, 'CN'),
+      getAttr(issuerAttrs, 'O'),
+    ].filter(Boolean).join(', ') || 'Unknown Issuer';
+
+    const subject = [
+      getAttr(subjectAttrs, 'CN'),
+      getAttr(subjectAttrs, 'O'),
+    ].filter(Boolean).join(', ') || 'Unknown Subject';
+
+    const serialNumber = cert.serialNumber || 'Unknown';
+
+    this.logger.log(
+      `Certificate parsed: subject="${subject}", issuer="${issuer}", ` +
+      `valid ${cert.validity.notBefore.toISOString()} → ${cert.validity.notAfter.toISOString()}`,
+    );
+
     return {
       fingerprint,
-      issuer: 'Pending validation',
-      subject: 'Pending validation',
-      serialNumber: 'Pending',
-      validFrom: new Date(),
-      validTo: new Date(Date.now() + 365 * 24 * 60 * 60 * 1000), // 1 year default
+      issuer,
+      subject,
+      serialNumber,
+      validFrom: cert.validity.notBefore,
+      validTo: cert.validity.notAfter,
     };
   }
 

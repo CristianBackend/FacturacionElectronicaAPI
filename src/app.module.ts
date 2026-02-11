@@ -21,6 +21,7 @@ import { ValidationModule } from './validation/validation.module';
 import { RncModule } from './common/services/rnc.module';
 import { BuyersModule } from './buyers/buyers.module';
 import { QueueModule } from './queue/queue.module';
+import { SchedulerModule } from './scheduler/scheduler.module';
 import configuration from './config/configuration';
 
 @Module({
@@ -85,6 +86,7 @@ import configuration from './config/configuration';
     PdfModule,
     ContingencyModule,
     ReceptionModule,
+    SchedulerModule,
 
     // Utils
     HealthModule,

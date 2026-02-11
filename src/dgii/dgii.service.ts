@@ -102,6 +102,12 @@ export class DgiiService {
 
     // Cache token (expires in 1 hour, cache for 55 min)
     const expiresAt = new Date(Date.now() + 55 * 60 * 1000);
+
+    // Clean up expired tokens for this company
+    await this.prisma.dgiiToken.deleteMany({
+      where: { companyId, expiresAt: { lt: new Date() } },
+    });
+
     await this.prisma.dgiiToken.create({
       data: { tenantId, companyId, token, environment: environment as any, expiresAt },
     });
@@ -295,6 +301,29 @@ export class DgiiService {
       message: responseText,
       rawResponse: responseText,
     };
+  }
+
+  /**
+   * Send ARECF (Acuse de Recibo Electrónico) to DGII.
+   */
+  async sendArecf(
+    arecfXml: string,
+    token: string,
+    environment: string,
+  ): Promise<DgiiSubmissionResult> {
+    // ARECF uses the same commercial approval endpoint
+    return this.sendCommercialApproval(arecfXml, token, environment);
+  }
+
+  /**
+   * Send ACECF (Aprobación Comercial Electrónica) to DGII.
+   */
+  async sendAcecf(
+    acecfXml: string,
+    token: string,
+    environment: string,
+  ): Promise<DgiiSubmissionResult> {
+    return this.sendCommercialApproval(acecfXml, token, environment);
   }
 
   // ============================================================

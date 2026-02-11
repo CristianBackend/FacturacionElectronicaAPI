@@ -111,6 +111,7 @@ model Tenant {
   apiKeys      ApiKey[]
   webhooks     WebhookSubscription[]
   auditLogs    AuditLog[]
+  receivedDocuments ReceivedDocument[]
 
   @@map("tenants")
 }
@@ -138,6 +139,7 @@ model Company {
   sequences     Sequence[]
   invoices      Invoice[]
   dgiiTokens    DgiiToken[]
+  receivedDocuments ReceivedDocument[]
 
   @@unique([tenantId, rnc])
   @@index([tenantId])
@@ -474,4 +476,68 @@ model AuditLog {
   @@index([entityType, entityId])
   @@index([createdAt])
   @@map("audit_logs")
+}
+
+// ============================================================
+// RECEIVED DOCUMENTS (e-CF received from other emitters)
+// ============================================================
+enum ReceivedDocumentStatus {
+  RECEIVED      // Document received, pending acknowledgment
+  ACKNOWLEDGED  // ARECF sent to DGII
+  APPROVED      // ACECF approved sent to DGII
+  REJECTED      // ACECF rejected sent to DGII
+  ERROR         // Error processing
+
+  @@map("received_document_status")
+}
+
+model ReceivedDocument {
+  id              String                  @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  tenantId        String                  @map("tenant_id") @db.Uuid
+  companyId       String                  @map("company_id") @db.Uuid
+  
+  // e-CF identification
+  encf            String                  @db.VarChar(13)
+  ecfType         EcfType                 @map("ecf_type")
+  
+  // Emitter info
+  emitterRnc      String                  @map("emitter_rnc") @db.VarChar(11)
+  emitterName     String                  @map("emitter_name") @db.VarChar(250)
+  
+  // Document details
+  totalAmount     Decimal                 @map("total_amount") @db.Decimal(18, 2)
+  totalItbis      Decimal?                @map("total_itbis") @db.Decimal(18, 2)
+  issueDate       DateTime                @map("issue_date")
+  
+  // Status tracking
+  status          ReceivedDocumentStatus  @default(RECEIVED)
+  
+  // ARECF (Acuse de Recibo)
+  arecfXml        String?                 @map("arecf_xml") @db.Text
+  arecfSentAt     DateTime?               @map("arecf_sent_at")
+  arecfTrackId    String?                 @map("arecf_track_id") @db.VarChar(100)
+  
+  // ACECF (Aprobación/Rechazo Comercial)
+  acecfXml        String?                 @map("acecf_xml") @db.Text
+  acecfSentAt     DateTime?               @map("acecf_sent_at")
+  acecfTrackId    String?                 @map("acecf_track_id") @db.VarChar(100)
+  acecfStatus     String?                 @map("acecf_status") @db.VarChar(20) // Aprobado, Rechazado
+  rejectionReason String?                 @map("rejection_reason") @db.Text
+  
+  // Original XML
+  originalXml     String?                 @map("original_xml") @db.Text
+  
+  // Metadata
+  metadata        Json?
+  createdAt       DateTime                @default(now()) @map("created_at") @db.Timestamptz
+  updatedAt       DateTime                @default(now()) @updatedAt @map("updated_at") @db.Timestamptz
+
+  // Relations
+  tenant          Tenant                  @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  company         Company                 @relation(fields: [companyId], references: [id], onDelete: Cascade)
+
+  @@index([tenantId])
+  @@index([companyId])
+  @@unique([companyId, encf])
+  @@map("received_documents")
 }

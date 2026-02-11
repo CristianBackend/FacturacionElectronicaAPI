@@ -1,8 +1,12 @@
 import { Module } from '@nestjs/common';
 import { ContingencyService } from './contingency.service';
 import { ContingencyController } from './contingency.controller';
+import { SigningModule } from '../signing/signing.module';
+import { DgiiModule } from '../dgii/dgii.module';
+import { CertificatesModule } from '../certificates/certificates.module';
 
 @Module({
+  imports: [SigningModule, DgiiModule, CertificatesModule],
   controllers: [ContingencyController],
   providers: [ContingencyService],
   exports: [ContingencyService],

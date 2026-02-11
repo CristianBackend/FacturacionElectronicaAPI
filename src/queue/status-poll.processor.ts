@@ -1,6 +1,6 @@
 import { Processor, WorkerHost } from '@nestjs/bullmq';
 import { Logger } from '@nestjs/common';
-import { Job } from 'bullmq';
+import { Job, DelayedError } from 'bullmq';
 import { PrismaService } from '../prisma/prisma.service';
 import { DgiiService } from '../dgii/dgii.service';
 import { SigningService } from '../signing/signing.service';
@@ -119,9 +119,16 @@ export class StatusPollProcessor extends WorkerHost {
         this.logger.log(`${invoice.encf}: ${invoice.status} → ${newStatus}`);
       }
 
-      // If still processing, throw to trigger BullMQ retry with backoff
+      // If still processing, schedule next poll with backoff
       if (!isFinal) {
-        throw new Error(`POLL_CONTINUE: ${invoice.encf} still ${newStatus} (attempt ${attempt})`);
+        const delayMs = this.getBackoffDelay(attempt);
+        this.logger.debug(
+          `${invoice.encf} still ${newStatus} (attempt ${attempt}), next poll in ${Math.round(delayMs / 1000)}s`,
+        );
+        await job.moveToDelayed(Date.now() + delayMs, job.token);
+        // Update job data with incremented attempt
+        await job.updateData({ ...job.data, attempt: attempt + 1 });
+        throw new DelayedError();
       }
 
       return {
@@ -133,16 +140,40 @@ export class StatusPollProcessor extends WorkerHost {
       };
 
     } catch (error: any) {
-      // Re-throw for BullMQ retry if it's a POLL_CONTINUE or network error
-      if (error.message?.startsWith('POLL_CONTINUE') ||
-          error.message?.includes('ECONNREFUSED') ||
-          error.message?.includes('ETIMEDOUT')) {
+      // DelayedError is BullMQ's signal — rethrow silently
+      if (error instanceof DelayedError) {
         throw error;
+      }
+
+      // Network errors — retry with backoff
+      if (error.message?.includes('ECONNREFUSED') ||
+          error.message?.includes('ETIMEDOUT')) {
+        const delayMs = this.getBackoffDelay(attempt);
+        this.logger.debug(`Network error for ${invoice.encf}, retrying in ${Math.round(delayMs / 1000)}s`);
+        await job.moveToDelayed(Date.now() + delayMs, job.token);
+        await job.updateData({ ...job.data, attempt: attempt + 1 });
+        throw new DelayedError();
       }
 
       this.logger.error(`Poll error for ${invoice.encf}: ${error.message}`);
       return { status: 'ERROR', error: error.message };
     }
+  }
+
+  /**
+   * Exponential backoff: 30s, 1m, 2m, 5m, 10m, 30m, 1h (capped)
+   */
+  private getBackoffDelay(attempt: number): number {
+    const delays = [
+      30_000,     // 30s
+      60_000,     // 1m
+      120_000,    // 2m
+      300_000,    // 5m
+      600_000,    // 10m
+      1_800_000,  // 30m
+      3_600_000,  // 1h
+    ];
+    return delays[Math.min(attempt - 1, delays.length - 1)];
   }
 
   private mapDgiiStatus(dgiiStatus: number): InvoiceStatus {

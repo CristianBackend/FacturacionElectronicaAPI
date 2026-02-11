@@ -1,6 +1,10 @@
 import { Injectable, Logger } from '@nestjs/common';
 import { PrismaService } from '../prisma/prisma.service';
 import { InvoiceStatus } from '@prisma/client';
+import { SigningService } from '../signing/signing.service';
+import { DgiiService } from '../dgii/dgii.service';
+import { CertificatesService } from '../certificates/certificates.service';
+import { DGII_STATUS } from '../xml-builder/ecf-types';
 
 /**
  * Contingency Module
@@ -8,18 +12,17 @@ import { InvoiceStatus } from '@prisma/client';
  * Handles the scenario when DGII services are unavailable.
  * Per DGII regulations, businesses can continue invoicing in contingency mode
  * and must submit within 72 hours once services are restored.
- *
- * Flow:
- * 1. Invoice creation fails to reach DGII → status = CONTINGENCY
- * 2. Contingency service periodically checks for pending invoices
- * 3. When DGII is available, resubmits pending invoices
- * 4. Updates status based on DGII response
  */
 @Injectable()
 export class ContingencyService {
   private readonly logger = new Logger(ContingencyService.name);
 
-  constructor(private readonly prisma: PrismaService) {}
+  constructor(
+    private readonly prisma: PrismaService,
+    private readonly signingService: SigningService,
+    private readonly dgiiService: DgiiService,
+    private readonly certificatesService: CertificatesService,
+  ) {}
 
   /**
    * Get all invoices in contingency status.
@@ -132,39 +135,100 @@ export class ContingencyService {
   }
 
   /**
-   * Process contingency queue.
-   * This would be called by a cron job or BullMQ worker.
-   * Returns count of successfully resubmitted invoices.
-   *
-   * Note: Actual DGII resubmission requires the DgiiService
-   * which will be wired when BullMQ/Redis is available.
+   * Process contingency queue — resubmit pending invoices to DGII.
+   * Called by cron job or manually via POST /contingency/process.
    */
   async processQueue(): Promise<{ processed: number; failed: number; remaining: number }> {
     const pending = await this.prisma.invoice.findMany({
       where: { status: InvoiceStatus.CONTINGENCY },
       include: { company: true },
       orderBy: { createdAt: 'asc' },
-      take: 10, // Process in batches
+      take: 10,
     });
+
+    if (pending.length === 0) {
+      return { processed: 0, failed: 0, remaining: 0 };
+    }
+
+    // Quick DGII health check before processing batch
+    try {
+      const testInvoice = pending[0];
+      const { p12Buffer, passphrase } = await this.certificatesService.getDecryptedCertificate(
+        testInvoice.tenantId, testInvoice.companyId,
+      );
+      const { privateKey, certificate } = this.signingService.extractFromP12(p12Buffer, passphrase);
+      await this.dgiiService.getToken(
+        testInvoice.tenantId, testInvoice.companyId,
+        privateKey, certificate, testInvoice.company.dgiiEnv,
+      );
+    } catch (error: any) {
+      this.logger.warn(`DGII still unavailable, skipping contingency processing: ${error.message}`);
+      const remaining = pending.length;
+      return { processed: 0, failed: 0, remaining };
+    }
 
     let processed = 0;
     let failed = 0;
 
     for (const invoice of pending) {
       try {
-        // TODO: When DgiiService is wired with BullMQ:
-        // 1. Get certificate for company
+        // 1. Get certificate
+        const { p12Buffer, passphrase } = await this.certificatesService.getDecryptedCertificate(
+          invoice.tenantId, invoice.companyId,
+        );
+        const { privateKey, certificate } = this.signingService.extractFromP12(p12Buffer, passphrase);
+
         // 2. Sign the stored unsigned XML
+        if (!invoice.xmlUnsigned) {
+          throw new Error('No unsigned XML stored for invoice');
+        }
+        const { signedXml, securityCode } = this.signingService.signXml(
+          invoice.xmlUnsigned, privateKey, certificate,
+        );
+
         // 3. Authenticate with DGII
-        // 4. Submit signed XML
-        // 5. Update status based on response
+        const token = await this.dgiiService.getToken(
+          invoice.tenantId, invoice.companyId,
+          privateKey, certificate, invoice.company.dgiiEnv,
+        );
 
-        this.logger.debug(`Would resubmit invoice ${invoice.id} (${invoice.encf})`);
-        // For now, just log - actual resubmission will happen with full pipeline
+        // 4. Submit to DGII
+        const result = await this.dgiiService.submitEcf(
+          signedXml, `${invoice.encf}.xml`, token, invoice.company.dgiiEnv,
+        );
 
+        // 5. Update invoice
+        const newStatus = result.status === DGII_STATUS.ACCEPTED ? InvoiceStatus.ACCEPTED
+          : result.status === DGII_STATUS.REJECTED ? InvoiceStatus.REJECTED
+          : result.status === DGII_STATUS.CONDITIONAL ? InvoiceStatus.CONDITIONAL
+          : InvoiceStatus.PROCESSING;
+
+        await this.prisma.invoice.update({
+          where: { id: invoice.id },
+          data: {
+            status: newStatus,
+            xmlSigned: signedXml,
+            securityCode,
+            trackId: result.trackId,
+            dgiiResponse: result as any,
+            dgiiMessage: result.message,
+            dgiiTimestamp: new Date(),
+          },
+        });
+
+        this.logger.log(`Contingency resubmit OK: ${invoice.encf} → ${newStatus}`);
         processed++;
       } catch (error: any) {
-        this.logger.error(`Failed to process contingency invoice ${invoice.id}: ${error.message}`);
+        this.logger.error(`Contingency resubmit FAILED: ${invoice.encf} — ${error.message}`);
+
+        await this.prisma.invoice.update({
+          where: { id: invoice.id },
+          data: {
+            status: InvoiceStatus.ERROR,
+            dgiiMessage: `Contingency retry failed: ${error.message}`,
+          },
+        });
+
         failed++;
       }
     }
@@ -173,6 +237,7 @@ export class ContingencyService {
       where: { status: InvoiceStatus.CONTINGENCY },
     });
 
+    this.logger.log(`Contingency batch: ${processed} OK, ${failed} failed, ${remaining} remaining`);
     return { processed, failed, remaining };
   }
 }

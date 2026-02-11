@@ -118,15 +118,24 @@ export class EcfProcessingProcessor extends WorkerHost {
           address: invoice.company.address || undefined,
         };
 
-        // We need totals to build RFCE — recalculate from stored data
+        // We need totals to build RFCE — recalculate from stored DTO
+        const storedMeta = typeof invoice.metadata === 'string'
+          ? JSON.parse(invoice.metadata)
+          : (invoice.metadata as any) || {};
+        const originalDto = storedMeta._originalDto;
+
+        if (!originalDto) {
+          throw new Error(`Invoice ${invoiceId} missing _originalDto in metadata — cannot rebuild RFCE`);
+        }
+
         const { totals } = this.xmlBuilder.buildEcfXml(
-          JSON.parse(invoice.metadata as string || '{}'),
+          originalDto,
           emitterData,
           invoice.encf!,
         );
 
         const rfceXml = this.xmlBuilder.buildRfceXml(
-          JSON.parse(invoice.metadata as string || '{}'),
+          originalDto,
           emitterData,
           invoice.encf!,
           totals,

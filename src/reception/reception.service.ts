@@ -1,23 +1,12 @@
-import { Injectable, NotFoundException, Logger } from '@nestjs/common';
+import { Injectable, NotFoundException, BadRequestException, Logger } from '@nestjs/common';
 import { PrismaService } from '../prisma/prisma.service';
 import { WebhooksService } from '../webhooks/webhooks.service';
-import { WebhookEvent } from '@prisma/client';
+import { SigningService } from '../signing/signing.service';
+import { DgiiService } from '../dgii/dgii.service';
+import { CertificatesService } from '../certificates/certificates.service';
+import { ResponseXmlBuilder, ArecfInput, AcecfInput } from '../xml-builder/response-xml-builder';
+import { WebhookEvent, EcfType, ReceivedDocumentStatus } from '@prisma/client';
 
-/**
- * Reception Module
- *
- * Handles the flow of receiving e-CF documents from other issuers.
- *
- * DGII flow for receiving:
- * 1. Another issuer sends e-CF to DGII referencing our RNC as buyer
- * 2. We poll/receive notification of the document
- * 3. We validate the document
- * 4. We respond with ARECF (Acuse Recibo Electrónico) - acknowledges receipt
- * 5. We respond with ACECF (Aprobación Comercial) - approves/rejects commercially
- *
- * For MVP, we store received documents and allow commercial approval/rejection.
- * Full DGII polling integration will come with BullMQ workers.
- */
 @Injectable()
 export class ReceptionService {
   private readonly logger = new Logger(ReceptionService.name);
@@ -25,150 +14,223 @@ export class ReceptionService {
   constructor(
     private readonly prisma: PrismaService,
     private readonly webhooksService: WebhooksService,
+    private readonly signingService: SigningService,
+    private readonly dgiiService: DgiiService,
+    private readonly certificatesService: CertificatesService,
+    private readonly responseXmlBuilder: ResponseXmlBuilder,
   ) {}
 
-  /**
-   * Store a received document (from DGII polling or manual upload).
-   */
   async storeReceived(tenantId: string, data: {
     companyId: string;
-    senderRnc: string;
-    senderName: string;
+    emitterRnc: string;
+    emitterName: string;
     encf: string;
     ecfType: string;
     totalAmount: number;
+    totalItbis?: number;
+    issueDate: string;
     xmlContent?: string;
   }) {
-    // Store in received_documents (using invoices table with a special flag)
-    // For a complete implementation, a separate received_documents table would be ideal
-    // For now, we'll use the audit_log to track received documents
+    const company = await this.prisma.company.findFirst({
+      where: { id: data.companyId, tenantId },
+    });
+    if (!company) throw new NotFoundException('Company not found');
 
-    const entry = await this.prisma.auditLog.create({
+    const existing = await this.prisma.receivedDocument.findUnique({
+      where: { companyId_encf: { companyId: data.companyId, encf: data.encf } },
+    });
+    if (existing) {
+      throw new BadRequestException(`Documento ${data.encf} ya fue recibido anteriormente`);
+    }
+
+    const received = await this.prisma.receivedDocument.create({
       data: {
         tenantId,
-        entityType: 'received_document',
-        entityId: data.encf,
-        action: 'received',
-        metadata: {
-          companyId: data.companyId,
-          senderRnc: data.senderRnc,
-          senderName: data.senderName,
-          encf: data.encf,
-          ecfType: data.ecfType,
-          totalAmount: data.totalAmount,
-          status: 'pending_approval',
-          receivedAt: new Date().toISOString(),
-        },
+        companyId: data.companyId,
+        encf: data.encf,
+        ecfType: data.ecfType as EcfType,
+        emitterRnc: data.emitterRnc,
+        emitterName: data.emitterName,
+        totalAmount: data.totalAmount,
+        totalItbis: data.totalItbis,
+        issueDate: new Date(data.issueDate),
+        originalXml: data.xmlContent,
+        status: ReceivedDocumentStatus.RECEIVED,
       },
     });
 
-    // Dispatch webhook
+    try {
+      await this.sendArecf(tenantId, received.id);
+    } catch (error: any) {
+      this.logger.warn(`ARECF send failed for ${data.encf}: ${error.message}`);
+    }
+
     await this.webhooksService.dispatch(tenantId, WebhookEvent.DOCUMENT_RECEIVED, {
+      id: received.id,
       encf: data.encf,
-      senderRnc: data.senderRnc,
-      senderName: data.senderName,
+      emitterRnc: data.emitterRnc,
+      emitterName: data.emitterName,
       ecfType: data.ecfType,
       totalAmount: data.totalAmount,
     });
 
-    this.logger.log(`Document received: ${data.encf} from ${data.senderRnc}`);
+    this.logger.log(`Document received: ${data.encf} from ${data.emitterRnc}`);
 
     return {
-      id: entry.id,
+      id: received.id,
       encf: data.encf,
-      status: 'pending_approval',
-      message: 'Documento recibido. Pendiente de aprobación comercial.',
+      status: received.status,
+      message: 'Documento recibido. ARECF generado. Pendiente de aprobación comercial.',
     };
   }
 
-  /**
-   * List received documents for a tenant.
-   */
-  async findAll(tenantId: string, status?: string) {
-    const where: any = {
-      tenantId,
-      entityType: 'received_document',
+  async sendArecf(tenantId: string, receivedDocId: string) {
+    const doc = await this.prisma.receivedDocument.findFirst({
+      where: { id: receivedDocId, tenantId },
+      include: { company: true },
+    });
+    if (!doc) throw new NotFoundException('Received document not found');
+
+    const arecfInput: ArecfInput = {
+      receiverRnc: doc.company.rnc,
+      receiverName: doc.company.businessName,
+      emitterRnc: doc.emitterRnc,
+      emitterName: doc.emitterName,
+      ecfType: doc.ecfType,
+      encf: doc.encf,
+      totalAmount: Number(doc.totalAmount),
+      totalItbis: Number(doc.totalItbis || 0),
+      receivedDate: doc.createdAt,
     };
 
-    const entries = await this.prisma.auditLog.findMany({
-      where,
-      orderBy: { createdAt: 'desc' },
-      take: 100,
+    const arecfXml = this.responseXmlBuilder.buildArecfXml(arecfInput);
+
+    const { p12Buffer, passphrase } = await this.certificatesService.getDecryptedCertificate(
+      tenantId, doc.companyId,
+    );
+    const { privateKey, certificate } = this.signingService.extractFromP12(p12Buffer, passphrase);
+    const { signedXml } = this.signingService.signXml(arecfXml, privateKey, certificate);
+
+    const token = await this.dgiiService.getToken(
+      tenantId, doc.companyId, privateKey, certificate, doc.company.dgiiEnv,
+    );
+
+    const result = await this.dgiiService.sendArecf(signedXml, token, doc.company.dgiiEnv);
+
+    await this.prisma.receivedDocument.update({
+      where: { id: receivedDocId },
+      data: {
+        status: ReceivedDocumentStatus.ACKNOWLEDGED,
+        arecfXml: signedXml,
+        arecfSentAt: new Date(),
+        arecfTrackId: result.trackId,
+      },
     });
 
-    return entries
-      .filter((e) => {
-        if (!status) return true;
-        return (e.metadata as any)?.status === status;
-      })
-      .map((e) => ({
-        id: e.id,
-        ...(e.metadata as any),
-        createdAt: e.createdAt,
-      }));
+    this.logger.log(`ARECF sent for ${doc.encf}: TrackId ${result.trackId}`);
+    return { trackId: result.trackId };
   }
 
-  /**
-   * Approve or reject a received document (Commercial Approval - ACECF).
-   */
   async processApproval(
     tenantId: string,
     documentId: string,
     approved: boolean,
     rejectionReason?: string,
   ) {
-    const entry = await this.prisma.auditLog.findFirst({
-      where: {
-        id: documentId,
-        tenantId,
-        entityType: 'received_document',
-      },
+    const doc = await this.prisma.receivedDocument.findFirst({
+      where: { id: documentId, tenantId },
+      include: { company: true },
     });
 
-    if (!entry) throw new NotFoundException('Documento recibido no encontrado');
+    if (!doc) throw new NotFoundException('Documento recibido no encontrado');
 
-    const metadata = entry.metadata as any;
-    const newStatus = approved ? 'approved' : 'rejected';
+    if (doc.status === ReceivedDocumentStatus.APPROVED || doc.status === ReceivedDocumentStatus.REJECTED) {
+      throw new BadRequestException(`Documento ya fue ${doc.status === ReceivedDocumentStatus.APPROVED ? 'aprobado' : 'rechazado'}`);
+    }
 
-    // Create approval record
-    await this.prisma.auditLog.create({
+    if (!approved && !rejectionReason) {
+      throw new BadRequestException('Motivo de rechazo es obligatorio');
+    }
+
+    const acecfInput: AcecfInput = {
+      receiverRnc: doc.company.rnc,
+      receiverName: doc.company.businessName,
+      emitterRnc: doc.emitterRnc,
+      emitterName: doc.emitterName,
+      ecfType: doc.ecfType,
+      encf: doc.encf,
+      totalAmount: Number(doc.totalAmount),
+      totalItbis: Number(doc.totalItbis || 0),
+      approvalDate: new Date(),
+      approved,
+      rejectionReason,
+    };
+
+    const acecfXml = this.responseXmlBuilder.buildAcecfXml(acecfInput);
+
+    const { p12Buffer, passphrase } = await this.certificatesService.getDecryptedCertificate(
+      tenantId, doc.companyId,
+    );
+    const { privateKey, certificate } = this.signingService.extractFromP12(p12Buffer, passphrase);
+    const { signedXml } = this.signingService.signXml(acecfXml, privateKey, certificate);
+
+    const token = await this.dgiiService.getToken(
+      tenantId, doc.companyId, privateKey, certificate, doc.company.dgiiEnv,
+    );
+
+    const result = await this.dgiiService.sendAcecf(signedXml, token, doc.company.dgiiEnv);
+
+    const newStatus = approved ? ReceivedDocumentStatus.APPROVED : ReceivedDocumentStatus.REJECTED;
+
+    await this.prisma.receivedDocument.update({
+      where: { id: documentId },
       data: {
-        tenantId,
-        entityType: 'received_document',
-        entityId: metadata.encf,
-        action: approved ? 'commercial_approval' : 'commercial_rejection',
-        metadata: {
-          ...metadata,
-          status: newStatus,
-          approvedAt: approved ? new Date().toISOString() : undefined,
-          rejectedAt: !approved ? new Date().toISOString() : undefined,
-          rejectionReason,
-        },
+        status: newStatus,
+        acecfXml: signedXml,
+        acecfSentAt: new Date(),
+        acecfTrackId: result.trackId,
+        acecfStatus: approved ? 'Aprobado' : 'Rechazado',
+        rejectionReason: rejectionReason || null,
       },
     });
 
-    // Dispatch webhook
     await this.webhooksService.dispatch(
       tenantId,
       WebhookEvent.COMMERCIAL_APPROVAL_RECEIVED,
-      {
-        encf: metadata.encf,
-        senderRnc: metadata.senderRnc,
-        approved,
-        rejectionReason,
-      },
+      { encf: doc.encf, emitterRnc: doc.emitterRnc, approved, rejectionReason },
     );
 
-    this.logger.log(
-      `Document ${metadata.encf} ${approved ? 'approved' : 'rejected'} commercially`,
-    );
+    this.logger.log(`Document ${doc.encf} ${approved ? 'approved' : 'rejected'} commercially`);
 
     return {
-      encf: metadata.encf,
+      encf: doc.encf,
       status: newStatus,
+      trackId: result.trackId,
       message: approved
-        ? 'Documento aprobado comercialmente (ACECF)'
-        : `Documento rechazado: ${rejectionReason}`,
+        ? 'Documento aprobado comercialmente (ACECF enviado a DGII)'
+        : `Documento rechazado (ACECF enviado a DGII): ${rejectionReason}`,
     };
+  }
+
+  async findAll(tenantId: string, companyId?: string, status?: string) {
+    const where: any = { tenantId };
+    if (companyId) where.companyId = companyId;
+    if (status) where.status = status;
+
+    return this.prisma.receivedDocument.findMany({
+      where,
+      include: { company: { select: { rnc: true, businessName: true } } },
+      orderBy: { createdAt: 'desc' },
+      take: 100,
+    });
+  }
+
+  async findOne(tenantId: string, id: string) {
+    const doc = await this.prisma.receivedDocument.findFirst({
+      where: { id, tenantId },
+      include: { company: { select: { rnc: true, businessName: true } } },
+    });
+    if (!doc) throw new NotFoundException('Documento recibido no encontrado');
+    return doc;
   }
 }

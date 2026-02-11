@@ -12,6 +12,7 @@ import { DgiiService } from '../dgii/dgii.service';
 import { CertificatesService } from '../certificates/certificates.service';
 import { SequencesService } from '../sequences/sequences.service';
 import { ValidationService } from '../validation/validation.service';
+import { XsdValidationService } from '../validation/xsd-validation.service';
 import { RncValidationService } from '../common/services/rnc-validation.service';
 import { CreateInvoiceDto, TYPES_REQUIRING_RNC } from './dto/invoice.dto';
 import { InvoiceStatus, EcfType } from '@prisma/client';
@@ -33,6 +34,7 @@ export class InvoicesService {
     private readonly certificatesService: CertificatesService,
     private readonly sequencesService: SequencesService,
     private readonly validationService: ValidationService,
+    private readonly xsdValidation: XsdValidationService,
     private readonly rncValidation: RncValidationService,
   ) {}
 
@@ -169,6 +171,15 @@ export class InvoicesService {
       encf,
     );
 
+    // Step 3b: Validate XML against XSD schema
+    const xsdResult = await this.xsdValidation.validateXml(unsignedXml, typeCode);
+    if (!xsdResult.valid) {
+      this.logger.error(`XSD validation failed for ${encf}: ${xsdResult.errors.join('; ')}`);
+      throw new BadRequestException(
+        `XML no pasa validación XSD de DGII: ${xsdResult.errors.slice(0, 3).join('; ')}`,
+      );
+    }
+
     // Determine if RFCE (Factura Consumo < 250K)
     const isRfce = typeCode === 32 && totals.totalAmount < FC_FULL_SUBMISSION_THRESHOLD;
 
@@ -197,7 +208,7 @@ export class InvoicesService {
         exchangeRate: dto.currency?.exchangeRate,
         xmlUnsigned: unsignedXml,
         idempotencyKey: dto.idempotencyKey,
-        metadata: dto.metadata || undefined,
+        metadata: { ...dto.metadata, _originalDto: dto } as any,
       },
     });
 
