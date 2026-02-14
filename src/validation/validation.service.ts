@@ -218,9 +218,10 @@ export class ValidationService {
       throw new BadRequestException('Información de pago es obligatoria');
     }
 
-    if (input.payment.type < 1 || input.payment.type > 9) {
+    // TipoPago per DGII: 1=Contado, 2=Crédito, 3=Gratuito
+    if (input.payment.type < 1 || input.payment.type > 3) {
       throw new BadRequestException(
-        `Tipo de pago inválido (${input.payment.type}). Valores: 1-9`,
+        `TipoPago inválido (${input.payment.type}). Valores: 1=Contado, 2=Crédito, 3=Gratuito`,
       );
     }
   }

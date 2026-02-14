@@ -5,6 +5,7 @@ import { SigningService } from '../signing/signing.service';
 import { DgiiService } from '../dgii/dgii.service';
 import { CertificatesService } from '../certificates/certificates.service';
 import { ResponseXmlBuilder, ArecfInput, AcecfInput } from '../xml-builder/response-xml-builder';
+import { ACECF_EXCLUDED_TYPES, getTypeFromEncf } from '../xml-builder/ecf-types';
 import { WebhookEvent, EcfType, ReceivedDocumentStatus } from '@prisma/client';
 
 @Injectable()
@@ -115,7 +116,9 @@ export class ReceptionService {
       tenantId, doc.companyId, privateKey, certificate, doc.company.dgiiEnv,
     );
 
-    const result = await this.dgiiService.sendArecf(signedXml, token, doc.company.dgiiEnv);
+    // Per DGII p.59: ARECF filename = {RNCComprador}{eNCF}.xml
+    const arecfFileName = `${doc.company.rnc}${doc.encf}.xml`;
+    const result = await this.dgiiService.sendArecf(signedXml, token, doc.company.dgiiEnv, doc.emitterRnc, arecfFileName);
 
     await this.prisma.receivedDocument.update({
       where: { id: receivedDocId },
@@ -143,6 +146,16 @@ export class ReceptionService {
     });
 
     if (!doc) throw new NotFoundException('Documento recibido no encontrado');
+
+    // Per DGII Descripción Técnica p.28-29:
+    // ACECF does NOT apply to types E32, E41, E43, E46, E47
+    const typeCode = getTypeFromEncf(doc.encf);
+    if (ACECF_EXCLUDED_TYPES.includes(typeCode)) {
+      throw new BadRequestException(
+        `Aprobación comercial (ACECF) no aplica para tipo E${typeCode}. ` +
+        `Solo aplica a: E31, E33, E34, E44, E45.`,
+      );
+    }
 
     if (doc.status === ReceivedDocumentStatus.APPROVED || doc.status === ReceivedDocumentStatus.REJECTED) {
       throw new BadRequestException(`Documento ya fue ${doc.status === ReceivedDocumentStatus.APPROVED ? 'aprobado' : 'rechazado'}`);
@@ -178,7 +191,10 @@ export class ReceptionService {
       tenantId, doc.companyId, privateKey, certificate, doc.company.dgiiEnv,
     );
 
-    const result = await this.dgiiService.sendAcecf(signedXml, token, doc.company.dgiiEnv);
+    // Per DGII p.59: ACECF filename = {RNCComprador}{eNCF}.xml
+    // Per DGII Informe Técnico p.14: send to emitter AND to DGII
+    const acecfFileName = `${doc.company.rnc}${doc.encf}.xml`;
+    const result = await this.dgiiService.sendAcecf(signedXml, token, doc.company.dgiiEnv, doc.emitterRnc, acecfFileName);
 
     const newStatus = approved ? ReceivedDocumentStatus.APPROVED : ReceivedDocumentStatus.REJECTED;
 

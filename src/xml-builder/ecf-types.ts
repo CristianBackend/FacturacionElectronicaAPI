@@ -48,6 +48,13 @@ export const REQUIRES_BUYER_RNC = [31, 41, 45];
 /** Which e-CF types require InformacionReferencia */
 export const REQUIRES_REFERENCE = [33, 34]; // Notas débito y crédito
 
+/**
+ * e-CF types that do NOT apply Aprobación Comercial (ACECF).
+ * Per DGII Descripción Técnica p.28-29:
+ * ACECF only applies to: E31, E33, E34, E44, E45
+ */
+export const ACECF_EXCLUDED_TYPES = [32, 41, 43, 46, 47];
+
 /** ITBIS rates allowed in Dominican Republic */
 export const ITBIS_RATES = {
   STANDARD: 18,  // Tasa estándar
@@ -165,35 +172,60 @@ export const DGII_ENDPOINTS = {
   DEV: {
     base: 'https://ecf.dgii.gov.do/testecf',
     fc: 'https://fc.dgii.gov.do/testecf',
+    ambiente: 'testecf',
   },
   CERT: {
     base: 'https://ecf.dgii.gov.do/certecf',
     fc: 'https://fc.dgii.gov.do/certecf',
+    ambiente: 'certecf',
   },
   PROD: {
     base: 'https://ecf.dgii.gov.do/ecf',
-    fc: 'https://fc.dgii.gov.do',
+    fc: 'https://fc.dgii.gov.do/ecf',
+    ambiente: 'ecf',
   },
 } as const;
 
-/** DGII service paths */
+/**
+ * DGII service paths per Descripción Técnica v1.6
+ *
+ * URL pattern: {base}/{servicio}/api/{recurso}
+ * Example: https://ecf.dgii.gov.do/testecf/recepcion/api/facturaselectronicas
+ *
+ * Each entry has:
+ *   service: the service name segment in the URL
+ *   resource: the API resource path after the service
+ */
 export const DGII_SERVICES = {
-  SEED: '/api/autenticacion/semilla',
-  VALIDATE_SEED: '/api/autenticacion/validarsemilla',
-  SEND_ECF: '/api/facturaselectronicas',
-  QUERY_STATUS: '/api/consultaresultado',
-  QUERY_TRACK: '/api/consultaestado',
-  VOID: '/api/anulacion',
-  DIRECTORY: '/api/directorio',
-  STATUS_CHECK: '/api/estatusservicio',
-  // FC-specific (facturas consumo < 250K)
-  FC_RECEIVE: '/api/recepcionfc',
-  FC_QUERY: '/api/consultarfce',
-  // Aprobación Comercial
-  COMMERCIAL_APPROVAL: '/api/aprobacioncomercial',
-  // Comunicación Emisor-Receptor (solo precertificación)
-  COMM_EMISOR_RECEPTOR: '/api/comunicacion',
+  SEED: { service: 'autenticacion', resource: '/api/autenticacion/semilla' },
+  VALIDATE_SEED: { service: 'autenticacion', resource: '/api/autenticacion/validarsemilla' },
+  SEND_ECF: { service: 'recepcion', resource: '/api/facturaselectronicas' },
+  QUERY_RESULT: { service: 'consultaresultado', resource: '/api/consultas/estado' },
+  QUERY_STATE: { service: 'consultaestado', resource: '/api/consultas/estado' },
+  QUERY_TRACKIDS: { service: 'consultatrackids', resource: '/api/trackids/consulta' },
+  VOID: { service: 'anulacionrangos', resource: '/api/operaciones/anularrango' },
+  DIRECTORY: { service: 'consultadirectorio', resource: '/api/consultas/listado' },
+  DIRECTORY_BY_RNC: { service: 'consultadirectorio', resource: '/api/consultas/obtenerdirectorioporrnc' },
+  COMMERCIAL_APPROVAL: { service: 'aprobacioncomercial', resource: '/api/aprobacioncomercial' },
+  // FC-specific (facturas consumo < 250K) — uses fc.dgii.gov.do domain
+  FC_RECEIVE: { service: 'recepcionfc', resource: '/api/recepcion/ecf' },
+  // Consulta RFCE — fc.dgii.gov.do only (per Descripción Técnica p.17)
+  FC_QUERY: { service: 'consultarfce', resource: '/api/Consultas/Consulta' },
 } as const;
+
+/** Estatus servicios uses a separate domain */
+export const DGII_STATUS_SERVICE_URL = 'https://statusecf.dgii.gov.do/api/estatusservicios/obtenerestatus';
+
+/**
+ * Build a full DGII service URL.
+ * Pattern: {base}/{service.service}{service.resource}
+ */
+export function buildDgiiUrl(
+  baseUrl: string,
+  service: { service: string; resource: string },
+): string {
+  return `${baseUrl}/${service.service}${service.resource}`;
+}
 
 /** DGII response status codes */
 export const DGII_STATUS = {
@@ -226,20 +258,17 @@ export const STORAGE_RETENTION_YEARS = 10;
 // ============================================================
 
 /**
- * QR URL for standard e-CF (all types except FC < 250K)
- * Parameters: RncEmisor, RncComprador, ENCF, FechaEmision(dd-MM-aaaa),
- *             MontoTotal, FechaFirma(dd-MM-aaaa HH:mm:ss), CodigoSeguridad
+ * Resolve DgiiEnvironment enum to the ambiente path segment.
  */
-export const QR_URL_STANDARD = 'https://ecf.dgii.gov.do/ecf/ConsultaTimbre';
+export function getAmbiente(env: string): string {
+  return DGII_ENDPOINTS[env as keyof typeof DGII_ENDPOINTS]?.ambiente || 'testecf';
+}
 
 /**
- * QR URL for Factura Consumo < 250K
- * Parameters: RncEmisor, ENCF, MontoTotal, CodigoSeguridad
- */
-export const QR_URL_FC_UNDER_250K = 'https://fc.dgii.gov.do/eCF/ConsultaTimbreFC';
-
-/**
- * Build QR URL for standard e-CF per DGII spec
+ * Build QR URL for standard e-CF per DGII Descripción Técnica p.37-39.
+ * Pattern: https://ecf.dgii.gov.do/{ambiente}/consultatimbre?...
+ * Parameters per spec example: rncemisor, rnccomprador, encf, fechaemision,
+ *                               montototal, fechafirma, codigoseguridad
  */
 export function buildStandardQrUrl(params: {
   rncEmisor: string;
@@ -249,22 +278,28 @@ export function buildStandardQrUrl(params: {
   montoTotal: string;       // X.XX
   fechaFirma: string;       // dd-MM-aaaa HH:mm:ss
   codigoSeguridad: string;  // first 6 hex of SignatureValue hash
+  ambiente: string;         // testecf | certecf | ecf
 }): string {
   const p = params;
-  return `${QR_URL_STANDARD}?RncEmisor=${p.rncEmisor}&RncComprador=${p.rncComprador}&ENCF=${p.encf}&FechaEmision=${p.fechaEmision}&MontoTotal=${p.montoTotal}&FechaFirma=${encodeURIComponent(p.fechaFirma)}&CodigoSeguridad=${p.codigoSeguridad}`;
+  const baseUrl = `https://ecf.dgii.gov.do/${p.ambiente}/ConsultaTimbre`;
+  return `${baseUrl}?rncemisor=${p.rncEmisor}&rnccomprador=${p.rncComprador}&encf=${p.encf}&fechaemision=${p.fechaEmision}&montototal=${p.montoTotal}&fechafirma=${encodeURIComponent(p.fechaFirma)}&codigoseguridad=${p.codigoSeguridad}`;
 }
 
 /**
- * Build QR URL for FC < 250K per DGII spec
+ * Build QR URL for FC < 250K per DGII Descripción Técnica p.37-39.
+ * Pattern: https://fc.dgii.gov.do/{ambiente}/consultatimbrefc?...
+ * Parameters per spec example: rncemisor, encf, montototal, codigoseguridad
  */
 export function buildFcUnder250kQrUrl(params: {
   rncEmisor: string;
   encf: string;
   montoTotal: string;
   codigoSeguridad: string;
+  ambiente: string;         // testecf | certecf | ecf
 }): string {
   const p = params;
-  return `${QR_URL_FC_UNDER_250K}?RncEmisor=${p.rncEmisor}&ENCF=${p.encf}&MontoTotal=${p.montoTotal}&CodigoSeguridad=${p.codigoSeguridad}`;
+  const baseUrl = `https://fc.dgii.gov.do/${p.ambiente}/ConsultaTimbreFC`;
+  return `${baseUrl}?rncemisor=${p.rncEmisor}&encf=${p.encf}&montototal=${p.montoTotal}&codigoseguridad=${p.codigoSeguridad}`;
 }
 
 // ============================================================

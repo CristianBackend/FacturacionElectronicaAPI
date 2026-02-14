@@ -7,7 +7,7 @@ import {
 import { ConfigService } from '@nestjs/config';
 import { PrismaService } from '../prisma/prisma.service';
 import { SigningService } from '../signing/signing.service';
-import { DGII_ENDPOINTS, DGII_SERVICES, DGII_STATUS } from '../xml-builder/ecf-types';
+import { DGII_ENDPOINTS, DGII_SERVICES, DGII_STATUS, DGII_STATUS_SERVICE_URL, buildDgiiUrl } from '../xml-builder/ecf-types';
 
 /**
  * DGII Communication Service
@@ -64,8 +64,10 @@ export class DgiiService {
     const baseUrl = this.getBaseUrl(environment);
 
     // Step 1: Request seed
+    // URL: {base}/autenticacion/api/autenticacion/semilla
     this.logger.debug(`Requesting seed from DGII (${environment})...`);
-    const seedResponse = await this.httpGet(`${baseUrl}${DGII_SERVICES.SEED}`);
+    const seedUrl = buildDgiiUrl(baseUrl, DGII_SERVICES.SEED);
+    const seedResponse = await this.httpGet(seedUrl);
 
     if (!seedResponse.ok) {
       throw new ServiceUnavailableException(
@@ -79,12 +81,10 @@ export class DgiiService {
     const { signedXml: signedSeed } = this.signingService.signXml(seedXml, privateKey, certificate);
 
     // Step 3: Validate signed seed → JWT
+    // Per DGII spec: POST multipart/form-data with field "xml"
     this.logger.debug('Validating signed seed with DGII...');
-    const tokenResponse = await this.httpPost(
-      `${baseUrl}${DGII_SERVICES.VALIDATE_SEED}`,
-      signedSeed,
-      'application/xml',
-    );
+    const validateUrl = buildDgiiUrl(baseUrl, DGII_SERVICES.VALIDATE_SEED);
+    const tokenResponse = await this.httpPostMultipart(validateUrl, signedSeed, '');
 
     if (!tokenResponse.ok) {
       const errorBody = await tokenResponse.text();
@@ -127,11 +127,11 @@ export class DgiiService {
     environment: string,
   ): Promise<DgiiSubmissionResult> {
     const baseUrl = this.getBaseUrl(environment);
-    const url = `${baseUrl}${DGII_SERVICES.SEND_ECF}`;
+    const url = buildDgiiUrl(baseUrl, DGII_SERVICES.SEND_ECF);
 
     this.logger.debug(`Submitting e-CF to DGII: ${fileName}`);
 
-    const response = await this.httpPostMultipart(url, signedXml, token);
+    const response = await this.httpPostMultipart(url, signedXml, token, fileName);
     const responseText = await response.text();
 
     if (!response.ok) {
@@ -145,14 +145,16 @@ export class DgiiService {
       };
     }
 
-    const trackId = this.extractTrackId(responseText);
-    this.logger.log(`e-CF submitted. TrackId: ${trackId}`);
+    // Parse full response: { trackId, error, mensaje }
+    const { trackId, error: dgiiError, mensaje } = this.parseSubmissionResponse(responseText);
+    this.logger.log(`e-CF submitted. TrackId: ${trackId}${dgiiError ? ` Error: ${dgiiError}` : ''}`);
 
     return {
       success: true,
       trackId,
       status: DGII_STATUS.IN_PROCESS,
-      message: 'Documento enviado, en proceso de validación',
+      message: mensaje || 'Documento enviado, en proceso de validación',
+      error: dgiiError || undefined,
       rawResponse: responseText,
     };
   }
@@ -165,26 +167,30 @@ export class DgiiService {
     rfceXml: string,
     token: string,
     environment: string,
+    fileName = 'rfce.xml',
   ): Promise<DgiiSubmissionResult> {
     const endpoints = DGII_ENDPOINTS[environment as keyof typeof DGII_ENDPOINTS];
     if (!endpoints) throw new BadRequestException(`Invalid DGII environment: ${environment}`);
 
-    const url = `${endpoints.fc}${DGII_SERVICES.FC_RECEIVE}`;
-    this.logger.debug('Submitting RFCE to DGII FC service...');
+    // FC uses fc.dgii.gov.do domain with same service/resource pattern
+    const url = buildDgiiUrl(endpoints.fc, DGII_SERVICES.FC_RECEIVE);
+    this.logger.debug(`Submitting RFCE to DGII FC service: ${fileName}`);
 
-    const response = await this.httpPostMultipart(url, rfceXml, token);
+    const response = await this.httpPostMultipart(url, rfceXml, token, fileName);
     const responseText = await response.text();
 
-    // Parse RFCE response (Aceptado, Rechazado, Aceptado Condicional)
-    const status = this.parseRfceStatus(responseText);
+    // Parse full RFCE response: { codigo, estado, mensajes, encf, secuenciaUtilizada }
+    const parsed = this.parseRfceResponse(responseText);
 
     return {
-      success: status !== DGII_STATUS.REJECTED,
+      success: parsed.status !== DGII_STATUS.REJECTED,
       trackId: null, // RFCE doesn't return TrackId
-      status,
-      message: status === DGII_STATUS.ACCEPTED ? 'RFCE aceptado' :
-               status === DGII_STATUS.CONDITIONAL ? 'RFCE aceptado condicional' :
-               responseText,
+      status: parsed.status,
+      message: parsed.status === DGII_STATUS.ACCEPTED ? 'RFCE aceptado' :
+               parsed.status === DGII_STATUS.CONDITIONAL ? 'RFCE aceptado condicional' :
+               parsed.mensajes?.join('; ') || responseText,
+      encf: parsed.encf,
+      secuenciaUtilizada: parsed.secuenciaUtilizada,
       rawResponse: responseText,
     };
   }
@@ -201,13 +207,15 @@ export class DgiiService {
     anecfXml: string,
     token: string,
     environment: string,
+    fileName = 'anecf.xml',
   ): Promise<DgiiSubmissionResult> {
     const baseUrl = this.getBaseUrl(environment);
-    const url = `${baseUrl}${DGII_SERVICES.VOID}`;
+    // URL: {base}/anulacionrangos/api/operaciones/anularrango
+    const url = buildDgiiUrl(baseUrl, DGII_SERVICES.VOID);
 
-    this.logger.debug('Submitting ANECF (void sequences) to DGII...');
+    this.logger.debug(`Submitting ANECF (void sequences) to DGII: ${fileName}`);
 
-    const response = await this.httpPostMultipart(url, anecfXml, token);
+    const response = await this.httpPostMultipart(url, anecfXml, token, fileName);
     const responseText = await response.text();
 
     return {
@@ -229,7 +237,8 @@ export class DgiiService {
     environment: string,
   ): Promise<DgiiStatusResult> {
     const baseUrl = this.getBaseUrl(environment);
-    const url = `${baseUrl}${DGII_SERVICES.QUERY_TRACK}?trackid=${trackId}`;
+    // Consulta Resultado: {base}/consultaresultado/api/consultas/estado?trackid=...
+    const url = `${buildDgiiUrl(baseUrl, DGII_SERVICES.QUERY_RESULT)}?trackid=${trackId}`;
 
     const response = await this.httpGet(url, {
       Authorization: `bearer ${token}`,
@@ -261,7 +270,66 @@ export class DgiiService {
     environment: string,
   ): Promise<DgiiStatusResult> {
     const baseUrl = this.getBaseUrl(environment);
-    const url = `${baseUrl}${DGII_SERVICES.QUERY_STATUS}?rnc=${rncEmisor}&encf=${encf}`;
+    // Consulta Estado: {base}/consultaestado/api/consultas/estado?rncemisor=...&ncfelectronico=...
+    const url = `${buildDgiiUrl(baseUrl, DGII_SERVICES.QUERY_STATE)}?rncemisor=${rncEmisor}&ncfelectronico=${encf}`;
+
+    const response = await this.httpGet(url, {
+      Authorization: `bearer ${token}`,
+    });
+
+    const responseText = await response.text();
+
+    return {
+      trackId: '',
+      status: response.ok ? this.extractStatusCode(responseText) : DGII_STATUS.NOT_FOUND,
+      message: responseText,
+      rawResponse: responseText,
+    };
+  }
+
+  // ============================================================
+  // QUERY TRACKIDS (Consulta TrackIds - per Descripción Técnica p.25)
+  // ============================================================
+
+  async queryTrackIds(
+    rncEmisor: string,
+    encf: string,
+    token: string,
+    environment: string,
+  ): Promise<DgiiStatusResult> {
+    const baseUrl = this.getBaseUrl(environment);
+    const url = `${buildDgiiUrl(baseUrl, DGII_SERVICES.QUERY_TRACKIDS)}?rncemisor=${rncEmisor}&encf=${encf}`;
+
+    const response = await this.httpGet(url, {
+      Authorization: `bearer ${token}`,
+    });
+
+    const responseText = await response.text();
+
+    return {
+      trackId: '',
+      status: response.ok ? DGII_STATUS.ACCEPTED : DGII_STATUS.NOT_FOUND,
+      message: responseText,
+      rawResponse: responseText,
+    };
+  }
+
+  // ============================================================
+  // QUERY RFCE (Consulta RFCE - per Descripción Técnica p.17)
+  // ============================================================
+
+  async queryRfce(
+    rncEmisor: string,
+    encf: string,
+    securityCode: string,
+    token: string,
+    environment: string,
+  ): Promise<DgiiStatusResult> {
+    const endpoints = DGII_ENDPOINTS[environment as keyof typeof DGII_ENDPOINTS];
+    if (!endpoints) throw new BadRequestException(`Invalid DGII environment: ${environment}`);
+
+    // RFCE query uses fc.dgii.gov.do domain
+    const url = `${buildDgiiUrl(endpoints.fc, DGII_SERVICES.FC_QUERY)}?RNC_Emisor=${rncEmisor}&ENCF=${encf}&Cod_Seguridad_eCF=${securityCode}`;
 
     const response = await this.httpGet(url, {
       Authorization: `bearer ${token}`,
@@ -285,13 +353,14 @@ export class DgiiService {
     approvalXml: string,
     token: string,
     environment: string,
+    fileName = 'acecf.xml',
   ): Promise<DgiiSubmissionResult> {
     const baseUrl = this.getBaseUrl(environment);
-    const url = `${baseUrl}${DGII_SERVICES.COMMERCIAL_APPROVAL}`;
+    const url = buildDgiiUrl(baseUrl, DGII_SERVICES.COMMERCIAL_APPROVAL);
 
-    this.logger.debug('Submitting commercial approval to DGII...');
+    this.logger.debug(`Submitting commercial approval to DGII: ${fileName}`);
 
-    const response = await this.httpPostMultipart(url, approvalXml, token);
+    const response = await this.httpPostMultipart(url, approvalXml, token, fileName);
     const responseText = await response.text();
 
     return {
@@ -304,26 +373,92 @@ export class DgiiService {
   }
 
   /**
-   * Send ARECF (Acuse de Recibo Electrónico) to DGII.
+   * Send ARECF (Acuse de Recibo Electrónico) to the emitter.
+   *
+   * Per DGII Descripción Técnica p.52-58, the ARECF is sent directly to the
+   * emitter's endpoint at {emitterUrl}/fe/recepcion/api/ecf, NOT to DGII's
+   * aprobación comercial endpoint (that's only for ACECF).
+   *
+   * The emitter's base URL is obtained from the DGII directory.
    */
   async sendArecf(
     arecfXml: string,
     token: string,
     environment: string,
+    emitterRnc?: string,
+    fileName = 'arecf.xml',
   ): Promise<DgiiSubmissionResult> {
-    // ARECF uses the same commercial approval endpoint
-    return this.sendCommercialApproval(arecfXml, token, environment);
+    // If emitterRnc is provided, try to resolve emitter URL from DGII directory
+    if (emitterRnc) {
+      try {
+        const directoryResult = await this.queryDirectory(token, environment, emitterRnc);
+        const emitterUrl = this.extractEmitterUrl(directoryResult.data);
+
+        if (emitterUrl) {
+          const url = `${emitterUrl}/fe/recepcion/api/ecf`;
+          this.logger.debug(`Sending ARECF to emitter: ${url} (${fileName})`);
+
+          const response = await this.httpPostMultipart(url, arecfXml, token, fileName);
+          const responseText = await response.text();
+
+          return {
+            success: response.ok,
+            trackId: null,
+            status: response.ok ? DGII_STATUS.ACCEPTED : DGII_STATUS.REJECTED,
+            message: responseText,
+            rawResponse: responseText,
+          };
+        }
+
+        this.logger.warn(`Emitter URL not found for RNC ${emitterRnc}, cannot send ARECF`);
+      } catch (error: any) {
+        this.logger.warn(`Failed to resolve emitter URL for ARECF: ${error.message}`);
+      }
+    }
+
+    // Fallback: log warning that ARECF could not be delivered
+    this.logger.warn('ARECF not delivered to emitter — emitter URL not resolved');
+    return {
+      success: true,
+      trackId: null,
+      status: DGII_STATUS.ACCEPTED,
+      message: 'ARECF generado localmente. Pendiente entrega al emisor.',
+      rawResponse: '',
+    };
   }
 
   /**
-   * Send ACECF (Aprobación Comercial Electrónica) to DGII.
+   * Send ACECF (Aprobación Comercial Electrónica) to DGII and optionally to the emitter.
+   *
+   * Per DGII Informe Técnico p.14, modelo paso 5-6:
+   * - Step 5: Send to emitter via {emitterUrl}/fe/aprobacioncomercial/api/ecf
+   * - Step 6: Send to DGII via aprobacioncomercial endpoint
    */
   async sendAcecf(
     acecfXml: string,
     token: string,
     environment: string,
+    emitterRnc?: string,
+    fileName = 'acecf.xml',
   ): Promise<DgiiSubmissionResult> {
-    return this.sendCommercialApproval(acecfXml, token, environment);
+    // Step 5: Try to send ACECF to the original emitter first
+    if (emitterRnc) {
+      try {
+        const directoryResult = await this.queryDirectory(token, environment, emitterRnc);
+        const emitterUrl = this.extractEmitterUrl(directoryResult.data);
+
+        if (emitterUrl) {
+          const url = `${emitterUrl}/fe/aprobacioncomercial/api/ecf`;
+          this.logger.debug(`Sending ACECF to emitter: ${url}`);
+          await this.httpPostMultipart(url, acecfXml, token, fileName);
+        }
+      } catch (error: any) {
+        this.logger.warn(`Failed to send ACECF to emitter ${emitterRnc}: ${error.message}`);
+      }
+    }
+
+    // Step 6: Send to DGII
+    return this.sendCommercialApproval(acecfXml, token, environment, fileName);
   }
 
   // ============================================================
@@ -336,8 +471,14 @@ export class DgiiService {
     rnc?: string,
   ): Promise<DgiiDirectoryResult> {
     const baseUrl = this.getBaseUrl(environment);
-    let url = `${baseUrl}${DGII_SERVICES.DIRECTORY}`;
-    if (rnc) url += `?rnc=${rnc}`;
+    let url: string;
+    if (rnc) {
+      // Consulta directorio por RNC
+      url = `${buildDgiiUrl(baseUrl, DGII_SERVICES.DIRECTORY_BY_RNC)}?RNC=${rnc}`;
+    } else {
+      // Consulta listado completo
+      url = buildDgiiUrl(baseUrl, DGII_SERVICES.DIRECTORY);
+    }
 
     const response = await this.httpGet(url, {
       Authorization: `bearer ${token}`,
@@ -358,14 +499,21 @@ export class DgiiService {
 
   /**
    * Check DGII service availability before submitting.
+   * Per Descripción Técnica p.48: requires Authorization: Apikey header.
    * Recommended to call before batch operations.
    */
   async checkServiceStatus(environment: string): Promise<DgiiServiceStatus> {
-    const baseUrl = this.getBaseUrl(environment);
-    const url = `${baseUrl}${DGII_SERVICES.STATUS_CHECK}`;
+    // Estatus servicios uses a dedicated domain and Apikey auth per DGII spec
+    const url = DGII_STATUS_SERVICE_URL;
+    const apiKey = this.config.get<string>('DGII_STATUS_API_KEY') || '';
 
     try {
-      const response = await this.httpGet(url);
+      const headers: Record<string, string> = {};
+      if (apiKey) {
+        headers['Authorization'] = `Apikey ${apiKey}`;
+      }
+
+      const response = await this.httpGet(url, headers);
       const responseText = await response.text();
 
       return {
@@ -409,6 +557,28 @@ export class DgiiService {
     return null;
   }
 
+  private parseSubmissionResponse(responseText: string): { trackId: string | null; error: string | null; mensaje: string | null } {
+    try {
+      const json = JSON.parse(responseText);
+      return {
+        trackId: json.trackId || json.TrackId || null,
+        error: json.error || json.Error || null,
+        mensaje: json.mensaje || json.Mensaje || null,
+      };
+    } catch {}
+
+    // Fallback: XML extraction
+    const trackMatch = responseText.match(/<trackId>([\s\S]*?)<\/trackId>/i);
+    const errorMatch = responseText.match(/<error>([\s\S]*?)<\/error>/i);
+    const msgMatch = responseText.match(/<mensaje>([\s\S]*?)<\/mensaje>/i);
+
+    return {
+      trackId: trackMatch ? trackMatch[1].trim() : (responseText.trim() || null),
+      error: errorMatch ? errorMatch[1].trim() : null,
+      mensaje: msgMatch ? msgMatch[1].trim() : null,
+    };
+  }
+
   private extractTrackId(responseText: string): string | null {
     const match = responseText.match(/<trackId>([\s\S]*?)<\/trackId>/i);
     if (match) return match[1].trim();
@@ -431,13 +601,28 @@ export class DgiiService {
     return match ? parseInt(match[1], 10) : DGII_STATUS.NOT_FOUND;
   }
 
-  private parseRfceStatus(responseText: string): number {
-    // RFCE returns: Aceptado, Rechazado, Aceptado Condicional
+  private parseRfceResponse(responseText: string): { status: number; encf?: string; secuenciaUtilizada?: boolean; mensajes?: string[] } {
+    // Try JSON parse first: { codigo, estado, mensajes, encf, secuenciaUtilizada }
+    try {
+      const json = JSON.parse(responseText);
+      const codigo = json.codigo ?? json.Codigo;
+      const status = typeof codigo === 'number' ? codigo :
+        (typeof codigo === 'string' && /^\d+$/.test(codigo)) ? parseInt(codigo, 10) :
+        this.extractStatusCode(responseText);
+      return {
+        status,
+        encf: json.encf || json.Encf,
+        secuenciaUtilizada: json.secuenciaUtilizada ?? json.SecuenciaUtilizada,
+        mensajes: json.mensajes || json.Mensajes,
+      };
+    } catch {}
+
+    // Fallback: text matching
     const lower = responseText.toLowerCase();
-    if (lower.includes('aceptado condicional')) return DGII_STATUS.CONDITIONAL;
-    if (lower.includes('aceptado')) return DGII_STATUS.ACCEPTED;
-    if (lower.includes('rechazado')) return DGII_STATUS.REJECTED;
-    return this.extractStatusCode(responseText);
+    if (lower.includes('aceptado condicional')) return { status: DGII_STATUS.CONDITIONAL };
+    if (lower.includes('aceptado')) return { status: DGII_STATUS.ACCEPTED };
+    if (lower.includes('rechazado')) return { status: DGII_STATUS.REJECTED };
+    return { status: this.extractStatusCode(responseText) };
   }
 
   private parseStatusResponse(trackId: string, responseText: string): DgiiStatusResult {
@@ -467,32 +652,57 @@ export class DgiiService {
   }
 
   /**
+   * Extract emitter base URL from DGII directory response.
+   * The directory returns the emitter's registered URL for inter-taxpayer communication.
+   */
+  private extractEmitterUrl(directoryData: string): string | null {
+    try {
+      const json = JSON.parse(directoryData);
+      // DGII directory returns array of entries or single object
+      const entry = Array.isArray(json) ? json[0] : json;
+      return entry?.urlRecepcion || entry?.url || entry?.URLRecepcion || null;
+    } catch {
+      // Try XML extraction
+      const match = directoryData.match(/<urlRecepcion>([\s\S]*?)<\/urlRecepcion>/i);
+      return match ? match[1].trim() : null;
+    }
+  }
+
+  /**
    * HTTP POST as multipart/form-data (how DGII expects XML submissions).
    */
   private async httpPostMultipart(
     url: string,
     xmlContent: string,
     token: string,
+    fileName = 'ecf.xml',
   ): Promise<Response> {
     try {
       // DGII expects multipart/form-data with 'xml' field
+      // Per Descripción Técnica p.59: filename must be {RNCEmisor}{eNCF}.xml
       const boundary = `----ECFBoundary${Date.now()}`;
       const body = [
         `--${boundary}`,
-        'Content-Disposition: form-data; name="xml"; filename="ecf.xml"',
+        `Content-Disposition: form-data; name="xml"; filename="${fileName}"`,
         'Content-Type: text/xml',
         '',
         xmlContent,
         `--${boundary}--`,
       ].join('\r\n');
 
+      const headers: Record<string, string> = {
+        'Content-Type': `multipart/form-data; boundary=${boundary}`,
+        Accept: 'application/json',
+      };
+
+      // Token may be empty during seed validation (authentication step)
+      if (token) {
+        headers['Authorization'] = `bearer ${token}`;
+      }
+
       return await fetch(url, {
         method: 'POST',
-        headers: {
-          'Content-Type': `multipart/form-data; boundary=${boundary}`,
-          Authorization: `bearer ${token}`,
-          Accept: 'application/json',
-        },
+        headers,
         body,
       });
     } catch (error: any) {
@@ -554,6 +764,9 @@ export interface DgiiSubmissionResult {
   trackId: string | null;
   status: number;
   message: string;
+  error?: string;
+  encf?: string;
+  secuenciaUtilizada?: boolean;
   rawResponse: string;
 }
 

@@ -4,7 +4,7 @@ import { InvoiceStatus } from '@prisma/client';
 import { SigningService } from '../signing/signing.service';
 import { DgiiService } from '../dgii/dgii.service';
 import { CertificatesService } from '../certificates/certificates.service';
-import { DGII_STATUS } from '../xml-builder/ecf-types';
+import { DGII_STATUS, FC_FULL_SUBMISSION_THRESHOLD } from '../xml-builder/ecf-types';
 
 /**
  * Contingency Module
@@ -169,9 +169,27 @@ export class ContingencyService {
 
     let processed = 0;
     let failed = 0;
+    const CONTINGENCY_LIMIT_MS = 72 * 60 * 60 * 1000; // 72 hours in ms
 
     for (const invoice of pending) {
       try {
+        // Check 72h window per DGII regulations
+        const hoursInContingency = Date.now() - invoice.createdAt.getTime();
+        if (hoursInContingency > CONTINGENCY_LIMIT_MS) {
+          this.logger.warn(
+            `Invoice ${invoice.encf} exceeded 72h contingency window — marking as ERROR`,
+          );
+          await this.prisma.invoice.update({
+            where: { id: invoice.id },
+            data: {
+              status: InvoiceStatus.ERROR,
+              dgiiMessage: 'Ventana de contingencia de 72 horas excedida. Requiere gestión manual ante DGII.',
+            },
+          });
+          failed++;
+          continue;
+        }
+
         // 1. Get certificate
         const { p12Buffer, passphrase } = await this.certificatesService.getDecryptedCertificate(
           invoice.tenantId, invoice.companyId,
@@ -193,9 +211,22 @@ export class ContingencyService {
         );
 
         // 4. Submit to DGII
-        const result = await this.dgiiService.submitEcf(
-          signedXml, `${invoice.encf}.xml`, token, invoice.company.dgiiEnv,
-        );
+        // File name per DGII spec: {RNCEmisor}{eNCF}.xml
+        const fileName = `${invoice.company.rnc}${invoice.encf}.xml`;
+        const isRfce = invoice.ecfType === 'E32' &&
+          Number(invoice.totalAmount) < FC_FULL_SUBMISSION_THRESHOLD;
+
+        let result;
+        if (isRfce && invoice.xmlRfce) {
+          // FC < 250K: submit RFCE summary to fc.dgii.gov.do
+          result = await this.dgiiService.submitRfce(
+            invoice.xmlRfce, token, invoice.company.dgiiEnv, fileName,
+          );
+        } else {
+          result = await this.dgiiService.submitEcf(
+            signedXml, fileName, token, invoice.company.dgiiEnv,
+          );
+        }
 
         // 5. Update invoice
         const newStatus = result.status === DGII_STATUS.ACCEPTED ? InvoiceStatus.ACCEPTED

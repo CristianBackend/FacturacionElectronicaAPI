@@ -247,9 +247,11 @@ export class InvoicesService {
       );
 
       // Extract private key and certificate from .p12
+      // Per DGII p.60: validate that certificate SN matches company RNC
       const { privateKey, certificate } = this.signingService.extractFromP12(
         p12Buffer,
         passphrase,
+        company.rnc,
       );
 
       // Sign the XML
@@ -308,9 +310,10 @@ export class InvoicesService {
         );
       } else {
         // ========== STANDARD FLOW ==========
+        // File name per DGII spec: {RNCEmisor}{eNCF}.xml
         submissionResult = await this.dgiiService.submitEcf(
           signedXml,
-          `${encf}.xml`,
+          `${company.rnc}${encf}.xml`,
           token,
           company.dgiiEnv,
         );

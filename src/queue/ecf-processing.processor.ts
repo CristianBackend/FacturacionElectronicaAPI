@@ -80,8 +80,8 @@ export class EcfProcessingProcessor extends WorkerHost {
         tenantId, companyId,
       );
 
-      // 3. Sign XML
-      const { privateKey, certificate } = this.signingService.extractFromP12(p12Buffer, passphrase);
+      // 3. Sign XML (validate certificate SN matches RNC per DGII p.60)
+      const { privateKey, certificate } = this.signingService.extractFromP12(p12Buffer, passphrase, invoice.company.rnc);
       const { signedXml, securityCode, signTime } = this.signingService.signXml(
         invoice.xmlUnsigned, privateKey, certificate,
       );
@@ -147,13 +147,16 @@ export class EcfProcessingProcessor extends WorkerHost {
           data: { xmlRfce: rfceXml },
         });
 
+        // Per DGII p.59: RFCE filename = {RNCEmisor}{eNCF}.xml
         submissionResult = await this.dgiiService.submitRfce(
           rfceXml, token, invoice.company.dgiiEnv,
+          `${invoice.company.rnc}${invoice.encf}.xml`,
         );
       } else {
         // Standard flow
+        // File name per DGII spec: {RNCEmisor}{eNCF}.xml
         submissionResult = await this.dgiiService.submitEcf(
-          signedXml, `${invoice.encf}.xml`, token, invoice.company.dgiiEnv,
+          signedXml, `${invoice.company.rnc}${invoice.encf}.xml`, token, invoice.company.dgiiEnv,
         );
       }
 

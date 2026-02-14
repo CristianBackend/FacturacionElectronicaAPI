@@ -45,11 +45,21 @@ export interface InvoiceInput {
   /** Custom metadata (not sent to DGII) */
   metadata?: Record<string, any>;
 
+  /** Fecha de emisión override (DD-MM-YYYY). If not provided, uses current date.
+   * Useful for contingency resubmission to preserve original emission date. */
+  fechaEmision?: string;
+
   /** Sequence expiry date (auto-populated from sequences table) */
   sequenceExpiresAt?: string;
 
   /** Retention/Perception totals (mainly for E41 Compras) */
   retention?: RetentionInput;
+
+  /** SubtotalesInformativos (Section C, optional) */
+  subtotalesInformativos?: SubtotalInformativoInput[];
+
+  /** Paginacion (Section E, optional — per-page subtotals for multi-page invoices) */
+  paginacion?: PaginacionInput[];
 
   /** Additional info for E46 Exportaciones (InformacionesAdicionales section) */
   additionalInfo?: ExportAdditionalInfoInput;
@@ -212,6 +222,68 @@ export interface CurrencyInput {
   code: string;
   /** Exchange rate to DOP (up to 4 decimal places per DGII) */
   exchangeRate: number;
+}
+
+/** SubtotalesInformativos entry (Section C, optional, código 3) */
+export interface SubtotalInformativoInput {
+  /** Subtotal number (sequence) */
+  numero: number;
+  /** Name/description of this subtotal */
+  nombre: string;
+  /** Amount taxed at 18% */
+  gravadoI1?: number;
+  /** Amount taxed at 16% */
+  gravadoI2?: number;
+  /** Amount taxed at 0% */
+  gravadoI3?: number;
+  /** Exempt amount */
+  exento?: number;
+  /** Total ITBIS for subtotal */
+  totalItbis?: number;
+  /** ITBIS at 18% */
+  itbis1?: number;
+  /** ITBIS at 16% */
+  itbis2?: number;
+  /** ITBIS at 0% */
+  itbis3?: number;
+  /** Additional tax amount */
+  impuestoAdicional?: number;
+  /** Subtotal amount */
+  montoSubtotal: number;
+}
+
+/** Paginacion entry (Section E, optional, código 3) */
+export interface PaginacionInput {
+  /** Page number */
+  paginaNo: number;
+  /** First line number on this page */
+  noLineaDesde: number;
+  /** Last line number on this page */
+  noLineaHasta: number;
+  /** Gravado total for this page */
+  subtotalMontoGravadoPagina?: number;
+  /** Gravado at 18% for this page */
+  subtotalMontoGravado1Pagina?: number;
+  /** Gravado at 16% for this page */
+  subtotalMontoGravado2Pagina?: number;
+  /** Gravado at 0% for this page */
+  subtotalMontoGravado3Pagina?: number;
+  /** Exempt for this page */
+  subtotalExentoPagina?: number;
+  /** Total ITBIS for this page */
+  subtotalItbisPagina?: number;
+  /** ITBIS at 18% */
+  subtotalItbis1Pagina?: number;
+  /** ITBIS at 16% */
+  subtotalItbis2Pagina?: number;
+  /** ITBIS at 0% */
+  subtotalItbis3Pagina?: number;
+  /** Additional tax for this page */
+  subtotalImpuestoAdicionalPagina?: number;
+  /** Page subtotal amount */
+  montoSubtotalPagina: number;
+  /** Non-billable amount for this page */
+  subtotalMontoNoFacturablePagina?: number;
 }
 
 /** Document-level discount or surcharge */

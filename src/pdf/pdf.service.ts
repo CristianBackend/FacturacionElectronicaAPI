@@ -55,12 +55,24 @@ export class PdfService {
       fechaFirma: invoice.signedAt || invoice.createdAt,
       securityCode: invoice.securityCode || '000000',
       isFcUnder250k,
+      dgiiEnv: invoice.company.dgiiEnv,
     });
 
     const securityCode = invoice.securityCode || 'N/A';
     const signDate = invoice.signedAt
       ? this.fmtDateTime(new Date(invoice.signedAt))
       : 'No firmado';
+
+    // Extract RI-mandatory fields from metadata (stored from original DTO)
+    const meta = typeof invoice.metadata === 'object' && invoice.metadata !== null
+      ? (invoice.metadata as any)
+      : {};
+    const originalDto = meta._originalDto || {};
+    const fechaVencSecuencia = originalDto.sequenceExpiresAt
+      ? this.fmtDate(new Date(originalDto.sequenceExpiresAt))
+      : '';
+    const indicadorMontoGravado = originalDto.indicadorMontoGravado ?? 0;
+    const tipoIngresos = originalDto.items?.[0]?.incomeType || 1;
 
     // Reference info for NC/ND
     const isNcNd = typeCode === 33 || typeCode === 34;
@@ -156,8 +168,11 @@ export class PdfService {
     <div class="info-box">
       <h3>Documento</h3>
       <p><span class="label">Fecha Emisión:</span> <span class="value">${this.fmtDate(invoice.createdAt)}</span></p>
+      ${fechaVencSecuencia ? `<p><span class="label">Venc. Secuencia:</span> <span class="value">${fechaVencSecuencia}</span></p>` : ''}
+      <p><span class="label">Tipo Ingreso:</span> <span class="value">${this.getIncomeTypeName(tipoIngresos)}</span></p>
       <p><span class="label">Moneda:</span> <span class="value">${invoice.currency}${invoice.exchangeRate ? ` (TC: ${Number(invoice.exchangeRate).toFixed(4)})` : ''}</span></p>
       <p><span class="label">Forma Pago:</span> <span class="value">${this.getPaymentName(invoice.paymentType)}</span></p>
+      <p><span class="label">Monto Gravado:</span> <span class="value">${indicadorMontoGravado === 1 ? 'Incluye ITBIS' : 'No incluye ITBIS'}</span></p>
       ${invoice.trackId ? `<p><span class="label">Track ID:</span> <span class="value">${invoice.trackId}</span></p>` : ''}
     </div>
   </div>
@@ -208,7 +223,7 @@ export class PdfService {
       </p>
     </div>
     <div class="qr-section">
-      <img src="https://api.qrserver.com/v1/create-qr-code/?size=130x130&data=${encodeURIComponent(qrUrl)}" alt="QR DGII">
+      <img src="https://api.qrserver.com/v1/create-qr-code/?size=130x130&qzone=1&ecc=M&data=${encodeURIComponent(qrUrl)}" alt="QR DGII">
       <p class="code-label">Código de Seguridad</p>
       <p class="security-code">${securityCode}</p>
       <p class="code-label" style="margin-top: 4px;">Verificar en dgii.gov.do</p>
@@ -287,6 +302,14 @@ export class PdfService {
   // HELPERS
   // ============================================================
 
+  private getIncomeTypeName(type: number): string {
+    const names: Record<number, string> = {
+      1: 'Operacional', 2: 'Financieros', 3: 'Extraordinarios',
+      4: 'Arrendamientos', 5: 'Venta Activos', 6: 'Otros',
+    };
+    return names[type] || `${type}`;
+  }
+
   private getPaymentName(type: number | null): string {
     const names: Record<number, string> = {
       1: 'Efectivo', 2: 'Cheque/Transferencia', 3: 'Tarjeta',
@@ -338,6 +361,7 @@ export class PdfService {
       .replace(/&/g, '&amp;')
       .replace(/</g, '&lt;')
       .replace(/>/g, '&gt;')
-      .replace(/"/g, '&quot;');
+      .replace(/"/g, '&quot;')
+      .replace(/'/g, '&#39;');
   }
 }

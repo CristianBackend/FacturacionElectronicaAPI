@@ -3,6 +3,8 @@ import {
   InvoiceInput,
   InvoiceItemInput,
   InvoiceTotals,
+  SubtotalInformativoInput,
+  PaginacionInput,
 } from './invoice-input.interface';
 import {
   ECF_TYPE_CODES,
@@ -15,8 +17,6 @@ import {
   isIscEspecificoCigarrillo,
   isIscAdvaloremCigarrillo,
   isOtrosImpuestos,
-  buildStandardQrUrl,
-  buildFcUnder250kQrUrl,
 } from './ecf-types';
 import { ValidationService } from '../validation/validation.service';
 
@@ -80,7 +80,7 @@ export class XmlBuilderService {
 
     // Build XML sections
     const idDoc = this.buildIdDoc(typeCode, encf, input, totals.totalAmount);
-    const emisor = this.buildEmisor(emitter);
+    const emisor = this.buildEmisor(emitter, input.fechaEmision);
     const comprador = this.buildComprador(typeCode, input.buyer);
     const totalesXml = this.buildTotales(typeCode, totals, input);
 
@@ -101,15 +101,21 @@ export class XmlBuilderService {
 
     const detalles = this.buildDetallesItem(input.items, input.indicadorMontoGravado || 0, typeCode);
 
-    // Optional sections
+    // Optional sections (XSD order: DetallesItems → SubtotalesInformativos → DescuentosORecargos → Paginacion → InformacionReferencia)
+    const subtotalesInf = input.subtotalesInformativos?.length
+      ? this.buildSubtotalesInformativos(input.subtotalesInformativos)
+      : '';
     const descuentos = input.discountsOrSurcharges?.length
       ? this.buildDescuentosORecargos(input.discountsOrSurcharges)
+      : '';
+    const paginacion = input.paginacion?.length
+      ? this.buildPaginacion(input.paginacion)
       : '';
     const referencia = REQUIRES_REFERENCE.includes(typeCode) && input.reference
       ? this.buildInformacionReferencia(input.reference)
       : '';
 
-    // Assemble final XML (XSD order: Encabezado[IdDoc,Emisor,Comprador,InfoAdicionales,Transporte,Totales,OtraMoneda] → DetallesItems → DescuentosORecargos → InformacionReferencia)
+    // Assemble final XML per XSD xs:sequence order
     const xml = [
       '<?xml version="1.0" encoding="UTF-8"?>',
       '<ECF xmlns="http://dgii.gov.do/eCF">',
@@ -124,7 +130,9 @@ export class XmlBuilderService {
       otraMoneda,
       '  </Encabezado>',
       detalles,
+      subtotalesInf,
       descuentos,
+      paginacion,
       referencia,
       '</ECF>',
     ]
@@ -404,7 +412,7 @@ export class XmlBuilderService {
     // TablaFormasPago: 3  3  3  0  3  0  3  3  3  3
     const noFormasPago = [34, 43];
     if (!noFormasPago.includes(typeCode)) {
-      const formaPago = input.payment.method || input.payment.type; // fallback to type for backward compat
+      const formaPago = input.payment.method || 1; // FormaPago defaults to 01 (Efectivo) if not specified
       xml += `      <TablaFormasPago>\n`;
       xml += `        <FormaDePago>\n`;
       xml += `          <FormaPago>${String(formaPago).padStart(2, '0')}</FormaPago>\n`;
@@ -418,8 +426,7 @@ export class XmlBuilderService {
     return xml;
   }
 
-  private buildEmisor(emitter: EmitterData): string {
-    const now = new Date();
+  private buildEmisor(emitter: EmitterData, fechaEmisionOverride?: string): string {
     let xml = '';
     xml += `    <Emisor>\n`;
     xml += `      <RNCEmisor>${escapeXml(emitter.rnc)}</RNCEmisor>\n`;
@@ -439,7 +446,9 @@ export class XmlBuilderService {
       xml += `      <Provincia>${escapeXml(emitter.province)}</Provincia>\n`;
     }
 
-    xml += `      <FechaEmision>${formatDate(now)}</FechaEmision>\n`;
+    // Use override date (e.g., for contingency resubmission) or current date
+    const fechaEmision = fechaEmisionOverride || formatDate(new Date());
+    xml += `      <FechaEmision>${fechaEmision}</FechaEmision>\n`;
     xml += `    </Emisor>`;
 
     return xml;
@@ -804,6 +813,115 @@ export class XmlBuilderService {
     return xml;
   }
 
+  /**
+   * Section C: SubtotalesInformativos (optional, código 3).
+   * Provides informational subtotals (e.g., by department, category).
+   */
+  private buildSubtotalesInformativos(subtotales: SubtotalInformativoInput[]): string {
+    if (!subtotales || subtotales.length === 0) return '';
+
+    let xml = '  <SubtotalesInformativos>\n';
+
+    for (const st of subtotales) {
+      xml += `    <SubtotalInformativo>\n`;
+      xml += `      <NumeroSubtotal>${st.numero}</NumeroSubtotal>\n`;
+      xml += `      <NombreSubtotal>${escapeXml(st.nombre)}</NombreSubtotal>\n`;
+
+      if (st.gravadoI1 != null && st.gravadoI1 > 0) {
+        xml += `      <SubGravadoI1>${fmt(st.gravadoI1)}</SubGravadoI1>\n`;
+      }
+      if (st.gravadoI2 != null && st.gravadoI2 > 0) {
+        xml += `      <SubGravadoI2>${fmt(st.gravadoI2)}</SubGravadoI2>\n`;
+      }
+      if (st.gravadoI3 != null && st.gravadoI3 > 0) {
+        xml += `      <SubGravadoI3>${fmt(st.gravadoI3)}</SubGravadoI3>\n`;
+      }
+      if (st.exento != null && st.exento > 0) {
+        xml += `      <SubExento>${fmt(st.exento)}</SubExento>\n`;
+      }
+      if (st.totalItbis != null && st.totalItbis > 0) {
+        xml += `      <SubTotalITBIS>${fmt(st.totalItbis)}</SubTotalITBIS>\n`;
+      }
+      if (st.itbis1 != null && st.itbis1 > 0) {
+        xml += `      <SubTotalITBIS1>${fmt(st.itbis1)}</SubTotalITBIS1>\n`;
+      }
+      if (st.itbis2 != null && st.itbis2 > 0) {
+        xml += `      <SubTotalITBIS2>${fmt(st.itbis2)}</SubTotalITBIS2>\n`;
+      }
+      if (st.itbis3 != null && st.itbis3 > 0) {
+        xml += `      <SubTotalITBIS3>${fmt(st.itbis3)}</SubTotalITBIS3>\n`;
+      }
+      if (st.impuestoAdicional != null && st.impuestoAdicional > 0) {
+        xml += `      <SubTotalImpuestoAdicional>${fmt(st.impuestoAdicional)}</SubTotalImpuestoAdicional>\n`;
+      }
+
+      xml += `      <MontoSubTotal>${fmt(st.montoSubtotal)}</MontoSubTotal>\n`;
+      xml += `    </SubtotalInformativo>\n`;
+    }
+
+    xml += '  </SubtotalesInformativos>';
+    return xml;
+  }
+
+  /**
+   * Section E: Paginacion (optional, código 3).
+   * Per-page subtotals for multi-page invoices.
+   */
+  private buildPaginacion(paginas: PaginacionInput[]): string {
+    if (!paginas || paginas.length === 0) return '';
+
+    let xml = '  <Paginacion>\n';
+
+    for (const p of paginas) {
+      xml += `    <Pagina>\n`;
+      xml += `      <PaginaNo>${p.paginaNo}</PaginaNo>\n`;
+      xml += `      <NoLineaDesde>${p.noLineaDesde}</NoLineaDesde>\n`;
+      xml += `      <NoLineaHasta>${p.noLineaHasta}</NoLineaHasta>\n`;
+
+      if (p.subtotalMontoGravadoPagina != null && p.subtotalMontoGravadoPagina > 0) {
+        xml += `      <SubtotalMontoGravadoPagina>${fmt(p.subtotalMontoGravadoPagina)}</SubtotalMontoGravadoPagina>\n`;
+      }
+      if (p.subtotalMontoGravado1Pagina != null && p.subtotalMontoGravado1Pagina > 0) {
+        xml += `      <SubtotalMontoGravado1Pagina>${fmt(p.subtotalMontoGravado1Pagina)}</SubtotalMontoGravado1Pagina>\n`;
+      }
+      if (p.subtotalMontoGravado2Pagina != null && p.subtotalMontoGravado2Pagina > 0) {
+        xml += `      <SubtotalMontoGravado2Pagina>${fmt(p.subtotalMontoGravado2Pagina)}</SubtotalMontoGravado2Pagina>\n`;
+      }
+      if (p.subtotalMontoGravado3Pagina != null && p.subtotalMontoGravado3Pagina > 0) {
+        xml += `      <SubtotalMontoGravado3Pagina>${fmt(p.subtotalMontoGravado3Pagina)}</SubtotalMontoGravado3Pagina>\n`;
+      }
+      if (p.subtotalExentoPagina != null && p.subtotalExentoPagina > 0) {
+        xml += `      <SubtotalExentoPagina>${fmt(p.subtotalExentoPagina)}</SubtotalExentoPagina>\n`;
+      }
+      if (p.subtotalItbisPagina != null && p.subtotalItbisPagina > 0) {
+        xml += `      <SubtotalITBISPagina>${fmt(p.subtotalItbisPagina)}</SubtotalITBISPagina>\n`;
+      }
+      if (p.subtotalItbis1Pagina != null && p.subtotalItbis1Pagina > 0) {
+        xml += `      <SubtotalITBIS1Pagina>${fmt(p.subtotalItbis1Pagina)}</SubtotalITBIS1Pagina>\n`;
+      }
+      if (p.subtotalItbis2Pagina != null && p.subtotalItbis2Pagina > 0) {
+        xml += `      <SubtotalITBIS2Pagina>${fmt(p.subtotalItbis2Pagina)}</SubtotalITBIS2Pagina>\n`;
+      }
+      if (p.subtotalItbis3Pagina != null && p.subtotalItbis3Pagina > 0) {
+        xml += `      <SubtotalITBIS3Pagina>${fmt(p.subtotalItbis3Pagina)}</SubtotalITBIS3Pagina>\n`;
+      }
+      if (p.subtotalImpuestoAdicionalPagina != null && p.subtotalImpuestoAdicionalPagina > 0) {
+        xml += `      <SubtotalImpuestoAdicionalPagina>${fmt(p.subtotalImpuestoAdicionalPagina)}</SubtotalImpuestoAdicionalPagina>\n`;
+      }
+
+      xml += `      <MontoSubtotalPagina>${fmt(p.montoSubtotalPagina)}</MontoSubtotalPagina>\n`;
+
+      if (p.subtotalMontoNoFacturablePagina != null && p.subtotalMontoNoFacturablePagina > 0) {
+        xml += `      <SubtotalMontoNoFacturablePagina>${fmt(p.subtotalMontoNoFacturablePagina)}</SubtotalMontoNoFacturablePagina>\n`;
+      }
+
+      xml += `    </Pagina>\n`;
+    }
+
+    xml += '  </Paginacion>';
+    return xml;
+  }
+
   private buildInformacionReferencia(ref: any): string {
     let xml = '  <InformacionReferencia>\n';
     xml += `    <NCFModificado>${escapeXml(ref.encf)}</NCFModificado>\n`;
@@ -828,7 +946,7 @@ export class XmlBuilderService {
     xml += `      <TipoCambio>${ValidationService.formatExchangeRate(rate)}</TipoCambio>\n`;
 
     // MontoGravadoTotalOtraMoneda
-    const gravadoTotal = r2(totals.taxableAmount18 + totals.taxableAmount16);
+    const gravadoTotal = r2(totals.taxableAmount18 + totals.taxableAmount16 + totals.taxableAmount0);
     xml += `      <MontoGravadoTotalOtraMoneda>${fmt(r2(gravadoTotal / rate))}</MontoGravadoTotalOtraMoneda>\n`;
 
     // Breakdown by rate
@@ -983,14 +1101,14 @@ export interface EmitterData {
   province?: string;
 }
 
-/** Escape XML special characters per DGII spec */
+/** Escape XML special characters per DGII Descripción Técnica p.63 */
 function escapeXml(str: string): string {
   return str
     .replace(/&/g, '&amp;')
     .replace(/</g, '&lt;')
     .replace(/>/g, '&gt;')
-    .replace(/"/g, '&quot;')
-    .replace(/'/g, '&apos;');
+    .replace(/"/g, '&#34;')
+    .replace(/'/g, '&#39;');
 }
 
 /** Format date as DD-MM-YYYY (FechaValidationType per DGII XSD e-CF v1.0) */
@@ -1001,15 +1119,3 @@ function formatDate(d: Date): string {
   return `${dd}-${mm}-${yyyy}`;
 }
 
-/** Format time as HH:MM:SS */
-function formatTime(d: Date): string {
-  const hh = String(d.getHours()).padStart(2, '0');
-  const mm = String(d.getMinutes()).padStart(2, '0');
-  const ss = String(d.getSeconds()).padStart(2, '0');
-  return `${hh}:${mm}:${ss}`;
-}
-
-/** Format datetime as DD-MM-YYYY HH:mm:ss (for QR/firma) */
-export function formatDateTime(d: Date): string {
-  return `${formatDate(d)} ${formatTime(d)}`;
-}
